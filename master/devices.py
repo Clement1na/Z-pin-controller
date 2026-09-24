@@ -34,6 +34,7 @@ class ServoAxis:
         self.max_expansion_mm = max_expansion_mm
         self.timeout_s = timeout_s
         self.device_factory = device_factory
+        self.cancel_event = None
         self.dev = None
 
     @property
@@ -68,6 +69,8 @@ class ServoAxis:
     def _wait_ready(self, dev) -> None:
         deadline = time.monotonic() + self.timeout_s
         while time.monotonic() < deadline:
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                raise RuntimeError("servo wait cancelled")
             status = dev.status
             if status["sw"] & 0x0008:
                 raise RuntimeError("servo fault before motion")
@@ -112,6 +115,8 @@ class ServoAxis:
         deadline = time.monotonic() + self.timeout_s
         tolerance = max(1, self._mm2count(0.05))
         while time.monotonic() < deadline:
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                raise RuntimeError("servo move cancelled")
             status = self.dev.status
             if status["sw"] & 0x0008:
                 raise RuntimeError("servo fault during move")
@@ -147,11 +152,14 @@ class Cnc3D:
     """三维模组。每次 move_to 都会等运动完成（wait_idle）。"""
 
     def __init__(self, port: str = "COM9", baud: int = 115200,
-                 feed: int = 1500, limits=(100.0, 100.0, 50.0)):
+                 feed: int = 1500, limits=(100.0, 100.0, 50.0),
+                 controller_factory=None):
         self.port = port
         self.baud = baud
         self.feed = feed
         self.limits = limits
+        self.controller_factory = controller_factory
+        self.cancel_event = None
         self.cnc = None
 
     @property
@@ -160,12 +168,19 @@ class Cnc3D:
 
     def connect(self) -> None:
         from cnc_grbl import GrblController  # 惰性导入
-        self.cnc = GrblController(port=self.port, baudrate=self.baud)
-        self.cnc.connect()
-        rep = self.cnc.status()
-        if (rep.state or "").lower().startswith("alarm"):
-            print("三维模组处于 Alarm，尝试 $X 解锁")
-            self.cnc.unlock()
+        factory = self.controller_factory or GrblController
+        cnc = factory(port=self.port, baudrate=self.baud)
+        try:
+            cnc.connect()
+            rep = cnc.status()
+            if (rep.state or "").lower().startswith("alarm"):
+                raise RuntimeError("CNC Alarm: operator must inspect and unlock manually")
+            cnc.send("G21")
+            cnc.send("G90")
+        except Exception:
+            cnc.close()
+            raise
+        self.cnc = cnc
 
     def close(self) -> None:
         if self.cnc is not None:
@@ -177,18 +192,42 @@ class Cnc3D:
         if not self.connected:
             raise RuntimeError("三维模组未连接")
         lx, ly, lz = self.limits
-        if not (0 <= x <= lx and 0 <= y <= ly and 0 <= z <= lz):
+        if not all(math.isfinite(v) for v in (x, y, z)) or not (0 <= x <= lx and 0 <= y <= ly and 0 <= z <= lz):
             raise ValueError(f"目标 ({x},{y},{z}) 超出软限位 (0..{lx},0..{ly},0..{lz})")
-        self.cnc.send(f"G90 G0 X{x:.3f} Y{y:.3f} Z{z:.3f} F{feed or self.feed}")
-        self.cnc.wait_idle()
+        chosen_feed = self.feed if feed is None else feed
+        if not math.isfinite(chosen_feed) or chosen_feed <= 0:
+            raise ValueError("CNC feed must be positive")
+        self.cnc.send(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{chosen_feed}")
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                raise RuntimeError("CNC move cancelled")
+            rep = self.cnc.status()
+            state = (rep.state or "").lower()
+            if state.startswith("alarm"):
+                raise RuntimeError("CNC entered Alarm during move")
+            if state == "idle":
+                position = self.position()
+                if position is not None and all(abs(actual - target) <= 0.05
+                                                for actual, target in zip(position, (x, y, z))):
+                    return
+            time.sleep(0.1)
+        raise TimeoutError("CNC did not reach requested position")
 
     def position(self) -> tuple[float, float, float] | None:
         """读回 WPos (x,y,z) mm；解析失败返回 None。"""
         if not self.connected:
             return None
         rep = self.cnc.status()
-        m = re.search(r"WPos:\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*([-\d.]+)", rep.raw)
-        return (float(m.group(1)), float(m.group(2)), float(m.group(3))) if m else None
+        def values(label: str) -> tuple[float, float, float] | None:
+            m = re.search(rf"{label}:\s*([-+\d.]+)\s*,\s*([-+\d.]+)\s*,\s*([-+\d.]+)", rep.raw)
+            return tuple(float(m.group(i)) for i in (1, 2, 3)) if m else None
+
+        work = values("WPos")
+        if work is not None:
+            return work
+        machine, offset = values("MPos"), values("WCO")
+        return tuple(m - o for m, o in zip(machine, offset)) if machine and offset else None
 
     def home(self) -> None:
         if not self.connected:
@@ -208,10 +247,15 @@ class Cnc3D:
 class InsertHead:
     """植入滑台 + 双气阀。协议（firmware/insert_head/insert_head.ino）：数字=绝对mm、z/e/d/a1/a0/b1/b0/q/s"""
 
-    def __init__(self, port: str = "COM7", baud: int = 115200, travel_mm: float = 50.0):
+    def __init__(self, port: str = "COM7", baud: int = 115200, travel_mm: float = 50.0,
+                 motion=None, serial_factory=None, startup_delay_s: float = 0.8):
         self.port = port
         self.baud = baud
         self.travel = travel_mm
+        self.motion = motion
+        self.serial_factory = serial_factory
+        self.startup_delay_s = startup_delay_s
+        self._stopped = False
         self.ser = None
 
     @property
@@ -220,8 +264,9 @@ class InsertHead:
 
     def connect(self) -> None:
         import serial  # 惰性导入
-        self.ser = serial.Serial(self.port, self.baud, timeout=0.1)
-        time.sleep(0.8)              # ESP32 若被 DTR 复位，等它打出帮助信息
+        factory = self.serial_factory or serial.Serial
+        self.ser = factory(self.port, self.baud, timeout=0.1)
+        time.sleep(self.startup_delay_s)              # ESP32 若被 DTR 复位，等它打出帮助信息
         self.ser.reset_input_buffer()
 
     def close(self) -> None:
@@ -236,7 +281,6 @@ class InsertHead:
     def _send(self, line: str) -> None:
         if not self.connected:
             raise RuntimeError("滑台未连接")
-        self.ser.reset_input_buffer()
         self.ser.write((line + "\n").encode("ascii"))
 
     def _read_until(self, keywords: tuple[str, ...], timeout: float) -> list[str]:
@@ -249,6 +293,9 @@ class InsertHead:
             line = raw.decode("utf-8", errors="replace").strip()
             if line:
                 got.append(line)
+                if "已紧急停止" in line:
+                    self._stopped = True
+                    raise RuntimeError("head stopped; position is untrusted")
                 if any(k in line for k in keywords):
                     return got
         raise TimeoutError(f"滑台应答超时（等待 {keywords}），已收: {got[-3:]}")
@@ -258,16 +305,25 @@ class InsertHead:
         self._send("s")
         lines = self._read_until(("当前位置",), 3.0)
         m = re.search(r"当前位置:\s*([-\d.]+)", lines[-1])
-        return float(m.group(1)) if m else float("nan")
+        if not m:
+            raise RuntimeError("head position reply is malformed")
+        return float(m.group(1))
 
     def move_mm(self, mm: float, timeout: float = 30.0) -> float:
         """绝对移动并等待到位，返回实际目标值（软限位 0..travel）。"""
-        mm = max(0.0, min(self.travel, mm))
+        if self._stopped:
+            raise RuntimeError("head stopped; operator recovery is required")
+        if self.motion is None:
+            raise RuntimeError("head work window has not been confirmed")
+        if (not math.isfinite(mm) or not self.motion.work_min_mm <= mm <= self.motion.work_max_mm
+                or not 0 <= mm <= self.travel):
+            raise ValueError("head target outside confirmed work window")
         self._send(f"{mm:.3f}")
         lines = self._read_until(("到达目标", "已紧急停止"), timeout)
-        for ln in lines:
-            if "已紧急停止" in ln:
-                raise RuntimeError("滑台被急停，位置已不可信，需重新对零")
+        echoes = [re.search(r"移动到\s*([-\d.]+)\s*mm", line) for line in lines]
+        targets = [float(match.group(1)) for match in echoes if match]
+        if not targets or abs(targets[-1] - mm) > 0.011:
+            raise RuntimeError("head target mismatch: firmware may have clamped the command")
         return mm
 
     def zero(self) -> None:
@@ -288,5 +344,6 @@ class InsertHead:
 
     def stop(self) -> None:
         """急停（若滑台正在运动）。"""
+        self._stopped = True
         if self.ser is not None:
             self.ser.write(b"q\n")

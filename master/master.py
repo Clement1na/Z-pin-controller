@@ -1,240 +1,203 @@
-# -*- coding: utf-8 -*-
-"""多头植入设备 总控
-=================================================================
-控制链路：
-  1. 变距模组  —— SV630N 伺服 ← EtherCAT ← PC（pysoem）
-  2. 三维模组  —— ESP32(Grbl/FluidNC) ← 串口 COM9 ← PC（G代码）
-  3. 植入滑台+双气阀 —— ESP32 ← 串口 ← PC（自研协议）
-本程序在一个进程里协调三路控制，统一急停、统一 mm 单位。
+"""Z-pin CLI. Simulation and live operation share one planner and coordinator."""
 
-运行：python master.py   （配置见同目录 config.toml）
-
-命令：
-  c               连接全部设备        cs/c3/ch  单独连 伺服/三维/滑台
-  d3 x y z        三维模组绝对移动mm   h3/x3     三维回零($H)/解锁($X)
-  a               执行单点植入流程     r         三维模组回到 (0,0,0)
-  p <mm>          变距伺服绝对移动     j <mm>    变距伺服相对移动
-  v <mm>          滑台绝对移动         z         滑台对零(当前位置=0)
-  e / d           滑台使能/释放        a1 a0 b1 b0   气阀手动开关
-  s               全部状态             !         急停(全停+关阀)
-  x / quit        退出(安全关闭)
-"""
 from __future__ import annotations
 
+import argparse
+import queue
 import sys
-import time
+import threading
 import tomllib
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
-from devices import Cnc3D, InsertHead, ServoAxis
-
-HELP = __doc__.split("命令：", 1)[-1]
-
-
-class ImplantMaster:
-    def __init__(self, cfg: dict):
-        s, c, h, cy = cfg["servo"], cfg["cnc3d"], cfg["head"], cfg["cycle"]
-        self.servo = ServoAxis(adapter=s["adapter"], lead_mm=s["lead_mm"],
-                               counts_per_rev=s["counts_per_rev"],
-                               vel_mm_s=s["vel_mm_s"])
-        self.cnc = Cnc3D(port=c["port"], baud=c["baud"], feed=c["feed"],
-                         limits=(c["x_max"], c["y_max"], c["z_max"]))
-        self.head = InsertHead(port=h["port"], baud=h["baud"],
-                               travel_mm=h["travel_mm"])
-        self.valve_delay = cy["valve_delay_ms"] / 1000.0
-        self.down_mm = cy["down_mm"]
-        self.up_mm = cy["up_mm"]
-
-    # ---------- 连接 ----------
-    def connect_servo(self) -> None:
-        if not self.servo.connected:
-            self.servo.connect()
-            print("变距伺服已连接（OP 状态，自动使能）")
-
-    def connect_cnc(self) -> None:
-        if not self.cnc.connected:
-            self.cnc.connect()
-            print(f"三维模组已连接 {self.cnc.port}")
-
-    def connect_head(self) -> None:
-        if not self.head.connected:
-            self.head.connect()
-            print(f"植入滑台已连接 {self.head.port}")
-
-    def connect_all(self) -> None:
-        errs = []
-        for name, fn in (("伺服", self.connect_servo),
-                         ("三维", self.connect_cnc),
-                         ("滑台", self.connect_head)):
-            try:
-                fn()
-            except Exception as ex:
-                errs.append(f"{name}: {ex}")
-        if errs:
-            print("部分设备连接失败：\n  " + "\n  ".join(errs))
-        self.check_ready()
-
-    def check_ready(self) -> None:
-        """运行自动流程前的检查清单。"""
-        states = []
-        for name, dev in (("伺服", self.servo), ("三维", self.cnc), ("滑台", self.head)):
-            states.append(f"{name}={'已连' if dev.connected else '未连'}")
-        print("设备状态: " + " | ".join(states))
-        print("自动流程前提：滑台已对零(z，最上端=0)且三维模组已定位到目标孔位")
-
-    # ---------- 单点植入流程 ----------
-    def cycle_one(self) -> None:
-        """开阀A → 滑台下行 → 关阀A → 开阀B → 滑台上行 → 关阀B"""
-        if not self.head.connected:
-            raise RuntimeError("植入滑台未连接")
-        head = self.head
-        pos = head.position_mm()
-        down_target = max(0.0, min(head.travel, pos - self.down_mm))   # 向下=坐标减小
-        up_target = max(0.0, min(head.travel, down_target + self.up_mm))
-
-        print(f"1. 开阀A");            head.valve("a", True);  time.sleep(self.valve_delay)
-        print(f"2. 滑台下行 {pos:.2f}→{down_target:.2f} mm")
-        head.move_mm(down_target)
-        print("3. 关阀A");            head.valve("a", False); time.sleep(self.valve_delay)
-        print("4. 开阀B");            head.valve("b", True);  time.sleep(self.valve_delay)
-        print(f"5. 滑台上行 {down_target:.2f}→{up_target:.2f} mm")
-        head.move_mm(up_target)
-        print("6. 关阀B");            head.valve("b", False); time.sleep(self.valve_delay)
-        print("单点植入流程完成")
-
-    # ---------- 急停 / 状态 / 退出 ----------
-    def estop(self) -> None:
-        print("!!!! 急停：滑台停+关阀, 三维hold, 伺服失能")
-        try:
-            self.head.stop()
-            self.head.valve("a", False)
-            self.head.valve("b", False)
-        except Exception as ex:
-            print(f"滑台急停异常: {ex}")
-        try:
-            self.cnc.hold()
-        except Exception:
-            pass
-        try:
-            self.servo.disable()
-        except Exception:
-            pass
-        print("急停完成。滑台位置已不可信，恢复时请重新 z 对零")
-
-    def status_all(self) -> None:
-        if self.servo.connected:
-            sv = self.servo
-            print(f"[变距伺服] 位置 {sv.position_mm:+.3f} mm"
-                  + ("  [故障!]" if sv.fault else ""))
-        if self.cnc.connected:
-            p = self.cnc.position()
-            print(f"[三维模组] WPos {p}" if p else "[三维模组] 位置解析失败")
-        if self.head.connected:
-            print(f"[植入滑台] 位置 {self.head.position_mm():.2f} mm (0..{self.head.travel:.0f})")
-
-    def close_all(self) -> None:
-        for name, fn in (("滑台", self.head.close),
-                         ("三维", self.cnc.close),
-                         ("伺服", self.servo.close)):
-            try:
-                fn()
-            except Exception:
-                pass
-        print("已安全退出")
+from master.coordinator import Coordinator, RunState
+from master.model import HeadMotion, JobSpec, MachineGeometry
+from master.planner import plan_grid
+from master.simulated import SimulationRig
 
 
-def parse3(args: list[str]) -> tuple[float, float, float]:
-    if len(args) < 3:
-        raise ValueError("需要 3 个数: x y z")
-    return tuple(float(v) for v in args[:3])  # type: ignore[return-value]
+def default_config_path() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "config.toml"
+    return Path(__file__).resolve().parent / "config.toml"
 
 
-def main() -> int:
-    cfg_path = Path(__file__).resolve().parent / "config.toml"
-    with open(cfg_path, "rb") as f:
-        cfg = tomllib.load(f)
-    m = ImplantMaster(cfg)
-    print("=" * 50)
-    print("多头植入设备 总控  (输入 ? 查看命令)")
-    print("=" * 50)
+def _known_geometry() -> MachineGeometry:
+    return MachineGeometry(station_count=5, station_width_mm=10,
+                           max_expansion_mm=10, servo_lead_mm=13.3333333)
 
+
+def _print_plan(job: JobSpec, plan) -> None:
+    print(f"Plan: {job.point_count} points, {len(plan.placements)} placements, "
+          f"needle pitch {plan.needle_pitch_mm:g} mm, servo {plan.servo_target_mm:g} mm")
+
+
+def run_simulation(job: JobSpec, *, inject_failure: bool = False) -> int:
+    plan = plan_grid(job, _known_geometry())
+    motion = HeadMotion(standby_mm=10, insertion_mm=5,
+                        work_min_mm=3, work_max_mm=13, datum_confirmed=True)
+    rig = SimulationRig(standby_mm=motion.standby_mm, scan_z_mm=0,
+                        fail_on_first_descent=inject_failure)
+    coordinator = Coordinator(rig.servo, rig.cnc, rig.head, motion,
+                              scan_z_mm=0, operator_confirmed=True, valve_delay_s=0)
+    _print_plan(job, plan)
+    result = coordinator.run(plan)
+    print(f"{result.state.name}: {result.completed_placements}/{result.total_placements} placements"
+          + (f"; {result.error}" if result.error else ""))
+    print("valves closed" if rig.valves_closed else "VALVE STATE UNSAFE")
+    return 0 if result.state is RunState.COMPLETE and rig.valves_closed else 1
+
+
+def _read_live_configuration(path: Path, confirmed: bool):
+    if not confirmed:
+        raise ValueError("configuration: --confirm-datum is required for live mode")
+    try:
+        with path.open("rb") as stream:
+            cfg = tomllib.load(stream)
+    except OSError as exc:
+        raise ValueError(f"configuration: cannot read {path}: {exc}") from exc
+
+    def required(section: str, key: str):
+        value = cfg.get(section, {}).get(key)
+        if value is None or value == "":
+            raise ValueError(f"configuration: [{section}] {key} is required")
+        return value
+
+    job = JobSpec(width_mm=required("job", "width_mm"),
+                  height_mm=required("job", "height_mm"),
+                  spacing_mm=required("job", "spacing_mm"),
+                  plate_thickness_mm=required("job", "plate_thickness_mm"))
+    geometry = _known_geometry()
+    lead = required("servo", "lead_mm")
+    if abs(lead - geometry.servo_lead_mm) > 1e-4:
+        raise ValueError("configuration: servo lead_mm conflicts with measured calibration")
+    required("servo", "adapter")
+    required("cnc3d", "port")
+    required("head", "port")
+    if cfg["cnc3d"]["port"] == cfg["head"]["port"]:
+        raise ValueError("configuration: CNC and head must use different ports")
+    if required("head", "firmware_verified") is not True:
+        raise ValueError("configuration: head firmware_verified must be true")
+    motion = HeadMotion(standby_mm=required("head", "standby_mm"),
+                        insertion_mm=required("head", "insertion_mm"),
+                        work_min_mm=required("head", "work_min_mm"),
+                        work_max_mm=required("head", "work_max_mm"),
+                        datum_confirmed=required("head", "datum_confirmed"))
+    if not 0 <= motion.work_min_mm < motion.work_max_mm <= required("head", "travel_mm"):
+        raise ValueError("configuration: head work window exceeds firmware coordinate range")
+    if required("cycle", "upper_release_after_retract") is not True:
+        raise ValueError("configuration: only verified upper-valve release protocol is supported")
+    scan_z = required("cnc3d", "scan_z_mm")
+    if not 0 <= scan_z <= required("cnc3d", "z_max"):
+        raise ValueError("configuration: scan_z_mm outside CNC Z limit")
+    plan = plan_grid(job, geometry)
+    if (max(p.cnc_x_mm for p in plan.placements) > required("cnc3d", "x_max")
+            or max(p.cnc_y_mm for p in plan.placements) > required("cnc3d", "y_max")):
+        raise ValueError("configuration: planned CNC location exceeds X/Y soft limit")
+    return cfg, job, geometry, motion, scan_z, plan
+
+
+def _read_stop_commands(commands: queue.Queue[str]) -> None:
     while True:
         try:
-            line = input("> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            line = "x"
-        if not line:
-            continue
-        parts = line.split()
-        c = parts[0].lower()
-        args = parts[1:]
-        try:
-            if c in ("x", "quit", "exit"):
-                break
-            elif c == "?":
-                print(HELP)
-            elif c == "c":
-                m.connect_all()
-            elif c == "cs":
-                m.connect_servo(); m.check_ready()
-            elif c == "c3":
-                m.connect_cnc(); m.check_ready()
-            elif c == "ch":
-                m.connect_head(); m.check_ready()
-            elif c == "d3":
-                x, y, z = parse3(args)
-                m.connect_cnc() if not m.cnc.connected else None
-                m.cnc.move_to(x, y, z)
-                print(f"三维到位 {m.cnc.position()}")
-            elif c == "r":
-                m.connect_cnc() if not m.cnc.connected else None
-                m.cnc.move_to(0, 0, 0)
-                print("三维已回 (0,0,0)")
-            elif c == "h3":
-                m.connect_cnc() if not m.cnc.connected else None
-                m.cnc.home()
-            elif c == "x3":
-                m.connect_cnc() if not m.cnc.connected else None
-                m.cnc.unlock()
-            elif c == "a":
-                m.cycle_one()
-            elif c in ("a1", "a0", "b1", "b0"):
-                m.connect_head() if not m.head.connected else None
-                m.head.valve(c[0], c[1] == "1")
-            elif c == "p" and args:
-                m.connect_servo() if not m.servo.connected else None
-                m.servo.move_mm(float(args[0]))
-                print(f"变距伺服位置 {m.servo.position_mm:+.3f} mm")
-            elif c == "j" and args:
-                m.connect_servo() if not m.servo.connected else None
-                m.servo.jog_mm(float(args[0]))
-                print(f"变距伺服位置 {m.servo.position_mm:+.3f} mm")
-            elif c == "v" and args:
-                m.connect_head() if not m.head.connected else None
-                tgt = m.head.move_mm(float(args[0]))
-                print(f"滑台到位 {tgt:.2f} mm")
-            elif c == "z":
-                m.connect_head() if not m.head.connected else None
-                m.head.zero()
-                print("滑台当前位置=0mm（务必是机械最上端）")
-            elif c == "e":
-                m.connect_head() if not m.head.connected else None
-                m.head.enable()
-            elif c == "d":
-                m.connect_head() if not m.head.connected else None
-                m.head.disable()
-            elif c == "s":
-                m.status_all()
-            elif c == "!":
-                m.estop()
-            else:
-                print("未知命令，? 查看帮助")
-        except Exception as ex:
-            print(f"错误: {ex}")
-    m.close_all()
-    return 0
+            commands.put(input("运行中，输入 ! 急停 > ").strip())
+        except EOFError:
+            return
+
+
+def run_live(config_path: Path, confirmed: bool) -> int:
+    cfg, job, geometry, motion, scan_z, plan = _read_live_configuration(config_path, confirmed)
+    from master.devices import Cnc3D, InsertHead, ServoAxis
+
+    sv, cn, hd = cfg["servo"], cfg["cnc3d"], cfg["head"]
+    servo = ServoAxis(adapter=sv["adapter"], lead_mm=geometry.servo_lead_mm,
+                      counts_per_rev=sv["counts_per_rev"], vel_mm_s=sv["vel_mm_s"])
+    cnc = Cnc3D(port=cn["port"], baud=cn["baud"], feed=cn["feed"],
+                limits=(cn["x_max"], cn["y_max"], cn["z_max"]))
+    head = InsertHead(port=hd["port"], baud=hd["baud"],
+                      travel_mm=hd["travel_mm"], motion=motion)
+    coordinator = Coordinator(servo, cnc, head, motion, scan_z_mm=scan_z,
+                              operator_confirmed=confirmed,
+                              valve_delay_s=cfg["cycle"]["valve_delay_ms"] / 1000)
+    try:
+        head.connect()
+        cnc.connect()
+        servo.connect()
+        _print_plan(job, plan)
+        print(f"连接后状态：CNC WPos={cnc.position()}，滑台={head.position_mm():.3f} mm；"
+              f"预期扫描 Z={scan_z:g} mm、滑台待机={motion.standby_mm:g} mm。")
+        if input("确认机械间隙、工作零点和供丝状态后，输入 RUN 开始：").strip() != "RUN":
+            print("已取消，未开始自动植入。")
+            return 1
+        print("实时运行：按 Enter 后输入 ! 可请求三路停止。")
+        commands: queue.Queue[str] = queue.Queue()
+        reader = threading.Thread(target=_read_stop_commands, args=(commands,), daemon=True)
+        reader.start()
+        holder: list = []
+
+        def execute() -> None:
+            try:
+                holder.append(coordinator.run(plan))
+            except Exception as exc:
+                holder.append(exc)
+
+        worker = threading.Thread(target=execute, daemon=True)
+        worker.start()
+        while worker.is_alive():
+            try:
+                command = commands.get(timeout=0.1)
+                if command == "!":
+                    coordinator.request_stop()
+            except queue.Empty:
+                pass
+            except KeyboardInterrupt:
+                coordinator.request_stop()
+        worker.join()
+        if not holder or isinstance(holder[0], Exception):
+            raise RuntimeError(f"live coordinator failed before motion: {holder[0] if holder else 'no result'}")
+        result = holder[0]
+        print(f"{result.state.name}: {result.completed_placements}/{result.total_placements} placements"
+              + (f"; {result.error}" if result.error else ""))
+        return 0 if result.state is RunState.COMPLETE else 1
+    finally:
+        if head.connected:
+            for which in ("a", "b"):
+                try:
+                    head.valve(which, False)
+                except Exception:
+                    pass
+        for device in (head, cnc, servo):
+            try:
+                device.close()
+            except Exception:
+                pass
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Z-pin five-head controller")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--smoke-test", action="store_true", help="run full reference job without hardware")
+    mode.add_argument("--simulate", action="store_true", help="run a specified job without hardware")
+    mode.add_argument("--live", action="store_true", help="connect to actual machine after preflight")
+    parser.add_argument("--width", type=float, default=360)
+    parser.add_argument("--height", type=float, default=360)
+    parser.add_argument("--spacing", type=float, default=4)
+    parser.add_argument("--thickness", type=float, default=5)
+    parser.add_argument("--inject-failure", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--config", type=Path, default=default_config_path())
+    parser.add_argument("--confirm-datum", action="store_true",
+                        help="confirm manual CNC work zero, safe scan height and head datum")
+    args = parser.parse_args(argv)
+    try:
+        if args.live:
+            return run_live(args.config, args.confirm_datum)
+        job = JobSpec(args.width, args.height, args.spacing, args.thickness)
+        return run_simulation(job, inject_failure=args.inject_failure)
+    except (ValueError, RuntimeError, KeyError, TypeError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

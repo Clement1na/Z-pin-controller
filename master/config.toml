@@ -1,35 +1,39 @@
-# 多头植入设备 总控配置
-# 改完保存后重新运行 master.py 生效
+# v0.2 live-machine template. Deliberately incomplete: --live fails before
+# opening hardware until measured values and the work zero are supplied.
+# --smoke-test and --simulate do not read this file.
 
-# ---------- 变距模组（SV630N 伺服, EtherCAT）----------
 [servo]
-# 网卡名，留空 = 自动选 Intel 有线网卡
-adapter = ""
-# ★ 辰凌变距模组的丝杆导程(mm)，查模组铭牌，用于 mm<->count 换算
-lead_mm = 13.3333333
-# 18bit 编码器，每圈 count（固定，不改）
+adapter = ""               # pysoem adapter name for the wired EtherCAT NIC
+lead_mm = 13.3333333      # measured equivalent pitch per motor revolution
 counts_per_rev = 262144
-# 默认速度 mm/s
 vel_mm_s = 1.0
 
-# ---------- 三维模组 X/Y/Z（ESP32 Grbl/FluidNC, 串口）----------
 [cnc3d]
-port = "COM9"     # ★ 三维模组 ESP32 的串口号，设备管理器里确认
+port = ""                  # TTC450 Pro USB serial port
 baud = 115200
-feed = 1500       # 默认进给速度 mm/min
-# 软限位（mm，按实际行程改）
-x_max = 100.0
+feed = 1500
+x_max = 100.0             # replace with measured safe work-coordinate limit
 y_max = 100.0
 z_max = 50.0
+# scan_z_mm = ...         # manually verified height safe for XY scanning
 
-# ---------- 植入滑台 GX28 + 双气阀（ESP32 自研协议, 串口）----------
 [head]
-port = "COM7"     # ★ 滑台 ESP32 的串口号
+port = ""                  # GX28 controller USB serial port
 baud = 115200
-travel_mm = 50.0  # 有效行程（与 insert_head.ino 中 TRAVEL_MM 一致）
+travel_mm = 50.0          # nominal firmware coordinate limit, NOT useful window
+firmware_verified = false
+datum_confirmed = false
+# standby_mm = ...        # actual position after opening the serial connection
+# insertion_mm = ...      # smaller coordinate: tested downward direction
+# work_min_mm = ...       # measured useful range, not full 50 mm
+# work_max_mm = ...
 
-# ---------- 单点植入流程参数 ----------
 [cycle]
-valve_delay_ms = 500   # 气阀/气缸动作稳定等待
-down_mm = 5.0          # 向下(植入方向)移动距离；坐标减小为向下，反了就改符号
-up_mm = 5.0            # 向上(退回)移动距离
+valve_delay_ms = 500
+upper_release_after_retract = false  # confirm on machine before full job
+
+# [job]
+# width_mm = 360.0
+# height_mm = 360.0
+# spacing_mm = 4.0
+# plate_thickness_mm = 5.0

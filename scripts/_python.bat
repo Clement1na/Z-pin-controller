@@ -33,6 +33,9 @@ rem ---------- 0) activated conda env (user chose it, so respect it) ----------
 if defined CONDA_PREFIX (
     if exist "%CONDA_PREFIX%\python.exe" set "ZPIN_PY=%CONDA_PREFIX%\python.exe"
 )
+if /I "%CONDA_DEFAULT_ENV%"=="base" (
+    if exist "%CONDA_PREFIX%\envs\zpin\python.exe" set "ZPIN_PY=%CONDA_PREFIX%\envs\zpin\python.exe"
+)
 
 rem ---------- 1) project venv ----------
 if not defined ZPIN_PY (
