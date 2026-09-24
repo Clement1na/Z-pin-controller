@@ -403,6 +403,9 @@ class InsertHead:
         targets = [float(match.group(1)) for match in echoes if match]
         if not targets or abs(targets[-1] - mm) > 0.011:
             raise RuntimeError("head target mismatch: firmware may have clamped the command")
+        readback = self.position_mm()
+        if abs(readback - mm) > 0.05:
+            raise RuntimeError(f"head position readback {readback:g} mm differs from target {mm:g} mm")
         return mm
 
     def zero(self) -> None:
