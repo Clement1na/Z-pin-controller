@@ -206,7 +206,8 @@ class Sv630n:
     # ---------------- 周期线程 ----------------
     def cyclic(self):
         while self.running:
-            self.master.send_processdata()
+            with self.lock:
+                self.master.send_processdata()
             wkc = self.master.receive_processdata(2000)
             inp = self.slave.input
             sw = struct.unpack_from('<H', inp, self.off_sw)[0]
@@ -215,6 +216,10 @@ class Sv630n:
             with self.lock:
                 enable, reset, move, target, vel = (self.enable, self.reset_fault,
                                                     self.move_req, self.target, self.vel)
+                if not enable:
+                    self.move_req = False
+                    self.trig_pending = False
+                    move = False
                 if move and enable and (sw & 0x006F) == 0x0027:
                     self.move_req = False
                 self.reset_fault = False
@@ -254,7 +259,10 @@ class Sv630n:
             if self.off_pv >= 0:                  # 6081 在 PDO 里，速度走 PDO
                 struct.pack_into('<i', out, self.off_pv, vel)
             struct.pack_into('<H', out, self.off_cw, cw)
-            self.slave.output = bytes(out)
+            with self.lock:
+                if not self.enable:
+                    struct.pack_into('<H', out, self.off_cw, 0x0006)
+                self.slave.output = bytes(out)
 
             with self.lock:
                 jobs, self.sdo_jobs = self.sdo_jobs, []
@@ -286,9 +294,23 @@ class Sv630n:
             time.sleep(CYCLE_S)
 
     # ---------------- 主线程命令 ----------------
+    def set_enabled(self, enabled):
+        with self.lock:
+            was_enabled = self.enable
+            self.enable = bool(enabled)
+            if not enabled or not was_enabled:
+                self.move_req = False
+                self.trig_pending = False
+            if not enabled and self.slave is not None and self.off_cw >= 0:
+                out = bytearray(self.slave.output)
+                struct.pack_into('<H', out, self.off_cw, 0x0006)
+                self.slave.output = bytes(out)
+
     def cmd_move(self, n):
         v, clipped = clamp_count(int(n))
         with self.lock:
+            if not self.enable:
+                raise RuntimeError('servo disabled: enable before motion')
             self.target = v
             self.move_req = True
         if clipped:
@@ -300,6 +322,8 @@ class Sv630n:
         if not -(2**31) <= target < 2**31:
             raise ValueError('raw servo target outside signed 32-bit range')
         with self.lock:
+            if not self.enable:
+                raise RuntimeError('servo disabled: enable before motion')
             self.target = target
             self.move_req = True
 
@@ -307,6 +331,8 @@ class Sv630n:
         raw = self.status['apos'] + int(n)
         v, clipped = clamp_count(raw)
         with self.lock:
+            if not self.enable:
+                raise RuntimeError('servo disabled: enable before motion')
             self.target = v
             self.move_req = True
         if clipped:
@@ -321,7 +347,7 @@ class Sv630n:
                 self.sdo_jobs.append(('wr', 0x6081, int(n)))
 
     def close(self):
-        self.enable = False
+        self.set_enabled(False)
         time.sleep(0.1)
         self.running = False
         time.sleep(0.1)
@@ -420,9 +446,9 @@ def main():
                 if c == 'q':
                     break
                 elif c == 'e':
-                    dev.enable = True
+                    dev.set_enabled(True)
                 elif c == 'd':
-                    dev.enable = False
+                    dev.set_enabled(False)
                 elif c == 'r':
                     dev.reset_fault = True
                 elif c == 'm' and len(parts) > 1:

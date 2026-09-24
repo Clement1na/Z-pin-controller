@@ -131,7 +131,7 @@ class GrblController:
             return self._injected_serial
         import serial
 
-        return serial.Serial(self.port, self.baudrate, timeout=0.1)
+        return serial.Serial(self.port, self.baudrate, timeout=0.1, write_timeout=1.0)
 
     def _require_serial(self) -> Any:
         if self._serial is None:

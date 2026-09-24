@@ -201,18 +201,16 @@ class ServoAxis:
     def disable(self) -> None:
         self.origin_count = None
         if self.dev is not None:
-            self.dev.enable = False
+            self.dev.set_enabled(False)
 
     def enable(self) -> None:
         if not self.connected:
             raise RuntimeError("servo is not connected")
-        with self.dev.lock:
-            self.dev.enable = True
+        self.dev.set_enabled(True)
         try:
             self._wait_ready(self.dev)
         except Exception:
-            with self.dev.lock:
-                self.dev.enable = False
+            self.dev.set_enabled(False)
             raise
 
 
@@ -334,7 +332,7 @@ class InsertHead:
     def connect(self) -> None:
         import serial  # 惰性导入
         factory = self.serial_factory or serial.Serial
-        self.ser = factory(self.port, self.baud, timeout=0.1)
+        self.ser = factory(self.port, self.baud, timeout=0.1, write_timeout=1.0)
         self.zero_confirmed = False
         self._stopped = False
         try:

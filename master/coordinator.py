@@ -44,6 +44,7 @@ class Coordinator:
         self.state = RunState.READY
         self.cancel_event = threading.Event()
         self._stop_lock = threading.Lock()
+        self._stop_errors: list[str] = []
         for device in (self.servo, self.cnc, self.head):
             device.cancel_event = self.cancel_event
 
@@ -77,18 +78,28 @@ class Coordinator:
             if self.cancel_event.is_set():
                 return
             self.cancel_event.set()
-        for action in (self.head.stop, self.cnc.hold, self.servo.disable):
-            try:
-                action()
-            except Exception:
-                pass
+            for name, action in (("head stop", self.head.stop),
+                                 ("CNC hold", self.cnc.hold),
+                                 ("servo disable", self.servo.disable)):
+                try:
+                    action()
+                except Exception as exc:
+                    self._stop_errors.append(f"{name}: {exc}")
 
-    def _close_valves(self) -> None:
+    def _close_valves(self) -> list[str]:
+        errors = []
         for which in ("a", "b"):
             try:
                 self.head.valve(which, False)
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(f"valve {which} close: {exc}")
+        return errors
+
+    def _stop_reason(self, reason: str) -> str:
+        errors = self._stop_errors + self._close_valves()
+        if errors:
+            return f"{reason}; safe state unverified: {'; '.join(errors)}"
+        return reason
 
     def _cycle_one(self) -> None:
         self._check_cancel()
@@ -124,15 +135,12 @@ class Coordinator:
             return RunResult(self.state, completed, len(plan.placements))
         except _StopRequested:
             self.request_stop()
-            self._close_valves()
             self.state = RunState.STOPPED
-            return RunResult(self.state, completed, len(plan.placements), "operator stop")
+            return RunResult(self.state, completed, len(plan.placements), self._stop_reason("operator stop"))
         except Exception as exc:
             if self.cancel_event.is_set():
-                self._close_valves()
                 self.state = RunState.STOPPED
-                return RunResult(self.state, completed, len(plan.placements), "operator stop")
+                return RunResult(self.state, completed, len(plan.placements), self._stop_reason("operator stop"))
             self.request_stop()
-            self._close_valves()
             self.state = RunState.FAULT
-            return RunResult(self.state, completed, len(plan.placements), str(exc))
+            return RunResult(self.state, completed, len(plan.placements), self._stop_reason(str(exc)))

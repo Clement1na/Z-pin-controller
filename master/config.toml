@@ -32,7 +32,7 @@ datum_confirmed = false  # set true only after measuring the signed useful windo
 valve_delay_ms = 500
 upper_release_after_retract = false  # confirm on machine before full job
 
-# [job]
+# [job]                  # defaults; explicit --width/--height/--spacing/--thickness override one run
 # width_mm = 360.0
 # height_mm = 360.0
 # spacing_mm = 4.0

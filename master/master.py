@@ -30,6 +30,8 @@ def _known_geometry() -> MachineGeometry:
 
 
 def _print_plan(job: JobSpec, plan) -> None:
+    print(f"Job: width {job.width_mm:g} mm, height {job.height_mm:g} mm, "
+          f"spacing {job.spacing_mm:g} mm, thickness {job.plate_thickness_mm:g} mm")
     print(f"Plan: {job.point_count} points, {len(plan.placements)} placements, "
           f"needle pitch {plan.needle_pitch_mm:g} mm, servo {plan.servo_target_mm:g} mm")
 
@@ -53,7 +55,8 @@ def run_simulation(job: JobSpec, *, inject_failure: bool = False) -> int:
     return 0 if result.state is RunState.COMPLETE and rig.valves_closed else 1
 
 
-def _read_live_configuration(path: Path, confirmed: bool):
+def _read_live_configuration(path: Path, confirmed: bool,
+                             job_overrides: dict[str, float] | None = None):
     if not confirmed:
         raise ValueError("configuration: --confirm-datum is required for live mode")
     try:
@@ -68,10 +71,13 @@ def _read_live_configuration(path: Path, confirmed: bool):
             raise ValueError(f"configuration: [{section}] {key} is required")
         return value
 
-    job = JobSpec(width_mm=required("job", "width_mm"),
-                  height_mm=required("job", "height_mm"),
-                  spacing_mm=required("job", "spacing_mm"),
-                  plate_thickness_mm=required("job", "plate_thickness_mm"))
+    job_defaults = {key: required("job", key) for key in
+                    ("width_mm", "height_mm", "spacing_mm", "plate_thickness_mm")}
+    overrides = job_overrides or {}
+    unknown = set(overrides) - set(job_defaults)
+    if unknown:
+        raise ValueError(f"configuration: unknown job override {', '.join(sorted(unknown))}")
+    job = JobSpec(**(job_defaults | overrides))
     geometry = _known_geometry()
     lead = required("servo", "lead_mm")
     if abs(lead - geometry.servo_lead_mm) > 1e-4:
@@ -150,8 +156,10 @@ def _prepare_live_zeros(servo, head) -> bool:
             print(f"设置失败：{exc}")
 
 
-def run_live(config_path: Path, confirmed: bool) -> int:
-    cfg, job, geometry, motion, scan_z, plan = _read_live_configuration(config_path, confirmed)
+def run_live(config_path: Path, confirmed: bool,
+             job_overrides: dict[str, float] | None = None) -> int:
+    cfg, job, geometry, motion, scan_z, plan = _read_live_configuration(
+        config_path, confirmed, job_overrides)
     from master.devices import Cnc3D, InsertHead, ServoAxis
 
     sv, cn, hd = cfg["servo"], cfg["cnc3d"], cfg["head"]
@@ -230,10 +238,10 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--smoke-test", action="store_true", help="run full reference job without hardware")
     mode.add_argument("--simulate", action="store_true", help="run a specified job without hardware")
     mode.add_argument("--live", action="store_true", help="connect to actual machine after preflight")
-    parser.add_argument("--width", type=float, default=360)
-    parser.add_argument("--height", type=float, default=360)
-    parser.add_argument("--spacing", type=float, default=4)
-    parser.add_argument("--thickness", type=float, default=5)
+    parser.add_argument("--width", type=float)
+    parser.add_argument("--height", type=float)
+    parser.add_argument("--spacing", type=float)
+    parser.add_argument("--thickness", type=float)
     parser.add_argument("--inject-failure", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--config", type=Path, default=default_config_path())
     parser.add_argument("--confirm-datum", action="store_true",
@@ -241,8 +249,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.live:
-            return run_live(args.config, args.confirm_datum)
-        job = JobSpec(args.width, args.height, args.spacing, args.thickness)
+            overrides = {key: value for key, value in
+                         (("width_mm", args.width), ("height_mm", args.height),
+                          ("spacing_mm", args.spacing), ("plate_thickness_mm", args.thickness))
+                         if value is not None}
+            return run_live(args.config, args.confirm_datum, job_overrides=overrides)
+        job = JobSpec(args.width if args.width is not None else 360,
+                      args.height if args.height is not None else 360,
+                      args.spacing if args.spacing is not None else 4,
+                      args.thickness if args.thickness is not None else 5)
         return run_simulation(job, inject_failure=args.inject_failure)
     except (ValueError, RuntimeError, KeyError, TypeError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
