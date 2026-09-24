@@ -27,15 +27,40 @@ class _Servo:
 
     def __init__(self, rig: SimulationRig):
         self.rig = rig
-        self.enabled = True
+        self.enabled = False
         self.position = 0.0
+        self.boot_position = 0.0
+        self.origin_count = None
+
+    @property
+    def setup_offset_mm(self) -> float:
+        return self.position - self.boot_position
+
+    def enable(self) -> None:
+        self.enabled = True
+        self.rig.events.append(("servo_enable",))
+
+    def jog_setup_mm(self, delta: float) -> None:
+        if not self.enabled or self.origin_count is not None or not 0 < abs(delta) <= 0.5:
+            raise RuntimeError("invalid setup jog")
+        self.position += delta
+        self.rig.events.append(("servo_setup_jog", delta))
+
+    def set_zero(self) -> None:
+        if not self.enabled:
+            raise RuntimeError("servo must be enabled before zero")
+        self.origin_count = self.position
+        self.rig.events.append(("servo_zero",))
 
     def move_mm(self, target: float) -> None:
-        self.position = target
+        if self.origin_count is None:
+            raise RuntimeError("servo zero missing")
+        self.position = self.origin_count + target
         self.rig.events.append(("servo", target))
 
     def disable(self) -> None:
         self.enabled = False
+        self.origin_count = None
         self.rig.events.append(("servo_disable",))
 
 
@@ -65,11 +90,19 @@ class _Head:
         self.position = rig.standby_mm
         self.valves = {"a": False, "b": False}
         self._failed = False
+        self.zero_confirmed = False
+
+    def zero(self) -> None:
+        self.position = 0.0
+        self.zero_confirmed = True
+        self.rig.events.append(("head_zero",))
 
     def position_mm(self) -> float:
         return self.position
 
     def move_mm(self, target: float) -> float:
+        if not self.zero_confirmed:
+            raise RuntimeError("head zero missing")
         self.rig.events.append(("head", target))
         if (self.rig.fail_on_first_descent and not self._failed
                 and target < self.rig.standby_mm):
@@ -83,4 +116,5 @@ class _Head:
         self.rig.events.append(("valve", which, open_))
 
     def stop(self) -> None:
+        self.zero_confirmed = False
         self.rig.events.append(("head_stop",))

@@ -36,10 +36,13 @@ def _print_plan(job: JobSpec, plan) -> None:
 
 def run_simulation(job: JobSpec, *, inject_failure: bool = False) -> int:
     plan = plan_grid(job, _known_geometry())
-    motion = HeadMotion(standby_mm=10, insertion_mm=5,
-                        work_min_mm=3, work_max_mm=13, datum_confirmed=True)
+    motion = HeadMotion(standby_mm=0, insertion_mm=-5,
+                        work_min_mm=-10, work_max_mm=0, datum_confirmed=True)
     rig = SimulationRig(standby_mm=motion.standby_mm, scan_z_mm=0,
                         fail_on_first_descent=inject_failure)
+    rig.servo.enable()
+    rig.servo.set_zero()
+    rig.head.zero()
     coordinator = Coordinator(rig.servo, rig.cnc, rig.head, motion,
                               scan_z_mm=0, operator_confirmed=True, valve_delay_s=0)
     _print_plan(job, plan)
@@ -85,8 +88,8 @@ def _read_live_configuration(path: Path, confirmed: bool):
                         work_min_mm=required("head", "work_min_mm"),
                         work_max_mm=required("head", "work_max_mm"),
                         datum_confirmed=required("head", "datum_confirmed"))
-    if not 0 <= motion.work_min_mm < motion.work_max_mm <= required("head", "travel_mm"):
-        raise ValueError("configuration: head work window exceeds firmware coordinate range")
+    if not -10 <= motion.work_min_mm < motion.insertion_mm < motion.standby_mm == 0 == motion.work_max_mm:
+        raise ValueError("configuration: head must use tested negative descent window [-10, 0] and standby zero")
     if required("cycle", "upper_release_after_retract") is not True:
         raise ValueError("configuration: only verified upper-valve release protocol is supported")
     scan_z = required("cnc3d", "scan_z_mm")
@@ -107,6 +110,46 @@ def _read_stop_commands(commands: queue.Queue[str]) -> None:
             return
 
 
+def _prepare_live_zeros(servo, head) -> bool:
+    print("警告：断电重启后，滑台和伺服都会把当前点当作软件零位；它不代表机械零位。")
+    print("先确认滑台处于安全待机位置；伺服应调整到靠紧的 2 mm 工位间距位置。")
+    print("伺服设置命令：ENABLE 使能；JOG ±毫米 小步点动（每次最多 0.5 mm）；"
+          "SERVO-ZERO 设当前点为伺服零位；HEAD-ZERO 确认滑台待机并发送 z；RUN 开始；QUIT 退出。")
+    print("已知方向：负距离张开、正距离靠紧；点动时须观察实际机构。")
+    print(f"伺服相对本次连接初始读数：{servo.setup_offset_mm:+.3f} mm（不是机械基准）。")
+    while True:
+        try:
+            command = input("安全设置 > ").strip().upper()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        try:
+            if command == "ENABLE":
+                servo.enable()
+                print("伺服已使能；请观察机构后再点动。")
+            elif command.startswith("JOG "):
+                delta = float(command.split(maxsplit=1)[1])
+                servo.jog_setup_mm(delta)
+                print(f"伺服已点动 {delta:+g} mm；相对连接初始读数 "
+                      f"{servo.setup_offset_mm:+.3f} mm。请检查实际位置。")
+            elif command == "SERVO-ZERO":
+                servo.set_zero()
+                print("伺服逻辑零位已记录为当前机械位置。")
+            elif command == "HEAD-ZERO":
+                head.zero()
+                print("滑台当前待机位置已设为软件 0 mm。")
+            elif command == "RUN":
+                if servo.origin_count is None or not head.zero_confirmed:
+                    print("禁止启动：请先完成 SERVO-ZERO 和 HEAD-ZERO。")
+                    continue
+                return True
+            elif command in ("QUIT", "Q", "!"):
+                return False
+            else:
+                print("无效命令；可用 ENABLE、JOG ±毫米、SERVO-ZERO、HEAD-ZERO、RUN、QUIT。")
+        except (ValueError, RuntimeError, TimeoutError) as exc:
+            print(f"设置失败：{exc}")
+
+
 def run_live(config_path: Path, confirmed: bool) -> int:
     cfg, job, geometry, motion, scan_z, plan = _read_live_configuration(config_path, confirmed)
     from master.devices import Cnc3D, InsertHead, ServoAxis
@@ -122,13 +165,15 @@ def run_live(config_path: Path, confirmed: bool) -> int:
                               operator_confirmed=confirmed,
                               valve_delay_s=cfg["cycle"]["valve_delay_ms"] / 1000)
     try:
+        print("连接设备前请先确认滑台位于安全待机点，伺服机构有点动余量；"
+              "上电显示 0 不代表机械零位。")
         head.connect()
         cnc.connect()
         servo.connect()
         _print_plan(job, plan)
-        print(f"连接后状态：CNC WPos={cnc.position()}，滑台={head.position_mm():.3f} mm；"
-              f"预期扫描 Z={scan_z:g} mm、滑台待机={motion.standby_mm:g} mm。")
-        if input("确认机械间隙、工作零点和供丝状态后，输入 RUN 开始：").strip() != "RUN":
+        print(f"连接后状态：CNC WPos={cnc.position()}，滑台软件读数={head.position_mm():.3f} mm；"
+              f"预期扫描 Z={scan_z:g} mm。读数不能证明机械零位。")
+        if not _prepare_live_zeros(servo, head):
             print("已取消，未开始自动植入。")
             return 1
         print("实时运行：按 Enter 后输入 ! 可请求三路停止。")
@@ -168,6 +213,10 @@ def run_live(config_path: Path, confirmed: bool) -> int:
                     head.valve(which, False)
                 except Exception:
                     pass
+        try:
+            servo.disable()
+        except Exception:
+            pass
         for device in (head, cnc, servo):
             try:
                 device.close()

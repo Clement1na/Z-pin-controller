@@ -239,7 +239,10 @@ class Sv630n:
                 elif st == 0x23:                  # Switched on
                     cw = 0x000F if enable else 0x0006
                 elif st == 0x27:                  # Operation enabled（CiA402: sw&0x6F==0x27）
-                    if move and enable:
+                    if not enable:
+                        cw = 0x0006               # Shutdown: leave Operation enabled
+                        self.trig_pending = False
+                    elif move:
                         struct.pack_into('<i', out, self.off_tp, target)
                         cw = 0x001F               # 0x0F + bit4 New Setpoint（bit6=0 绝对定位）
                         self.trig_pending = True
@@ -291,6 +294,15 @@ class Sv630n:
         if clipped:
             print(f'[软限位] 目标 {count2mm(int(n)):+.3f}mm 超出 [{SOFT_MIN_MM:g}, {SOFT_MAX_MM:g}]mm，已钳位到 {count2mm(v):+.3f}mm')
 
+    def cmd_move_raw(self, n):
+        """Raw PDO target for a caller that validates a session zero and limits."""
+        target = int(n)
+        if not -(2**31) <= target < 2**31:
+            raise ValueError('raw servo target outside signed 32-bit range')
+        with self.lock:
+            self.target = target
+            self.move_req = True
+
     def cmd_jog(self, n):
         raw = self.status['apos'] + int(n)
         v, clipped = clamp_count(raw)
@@ -336,7 +348,9 @@ def pick_adapter():
         raise RuntimeError('没找到任何网卡（Npcap 是否已装？）')
     for i, a in enumerate(adapters):
         d = _desc(a)
-        if 'intel' in d.lower() and 'wireless' not in d.lower() and 'bluetooth' not in d.lower():
+        if ('intel' in d.lower() and 'wireless' not in d.lower()
+                and 'wi-fi' not in d.lower() and 'wifi' not in d.lower()
+                and 'bluetooth' not in d.lower()):
             print(f'自动选择网卡[{i}]: {d}')
             return a.name
     for i, a in enumerate(adapters):

@@ -20,13 +20,13 @@ z_max = 50.0
 [head]
 port = ""                  # GX28 controller USB serial port
 baud = 115200
-travel_mm = 50.0          # nominal firmware coordinate limit, NOT useful window
-firmware_verified = false
-datum_confirmed = false
-# standby_mm = ...        # actual position after opening the serial connection
-# insertion_mm = ...      # smaller coordinate: tested downward direction
-# work_min_mm = ...       # measured useful range, not full 50 mm
-# work_max_mm = ...
+travel_mm = 50.0          # nominal slide travel; NOT the software work window
+firmware_verified = false # set true only after flashing and checking protocol 2 firmware
+datum_confirmed = false  # set true only after measuring the signed useful window
+# standby_mm = 0.0        # physical standby is manually confirmed then set to software zero
+# insertion_mm = -5.0     # example only: tested downward direction is negative
+# work_min_mm = -10.0     # example only: actual safe down limit must be measured
+# work_max_mm = 0.0       # firmware prohibits motion above standby
 
 [cycle]
 valve_delay_ms = 500

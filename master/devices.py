@@ -35,6 +35,8 @@ class ServoAxis:
         self.timeout_s = timeout_s
         self.device_factory = device_factory
         self.cancel_event = None
+        self.origin_count = None
+        self.boot_count = None
         self.dev = None
 
     @property
@@ -58,13 +60,24 @@ class ServoAxis:
             dev.open()
             dev.running = True
             threading.Thread(target=dev.cyclic, daemon=True).start()
-            with dev.lock:
-                dev.enable = True
-            self._wait_ready(dev)
+            self._wait_link(dev)
         except Exception:
             dev.close()
             raise
         self.dev = dev
+        self.origin_count = None
+        self.boot_count = dev.status["apos"]
+
+    def _wait_link(self, dev) -> None:
+        deadline = time.monotonic() + self.timeout_s
+        while time.monotonic() < deadline:
+            status = dev.status
+            if status["sw"] & 0x0008:
+                raise RuntimeError("servo fault on connect")
+            if status["wkc_ok"]:
+                return
+            time.sleep(0.01)
+        raise TimeoutError("EtherCAT working counter did not become valid")
 
     def _wait_ready(self, dev) -> None:
         deadline = time.monotonic() + self.timeout_s
@@ -82,6 +95,8 @@ class ServoAxis:
         raise TimeoutError("servo did not reach operation enabled state")
 
     def close(self) -> None:
+        self.origin_count = None
+        self.boot_count = None
         if self.dev is not None:
             self.dev.close()
             self.dev = None
@@ -96,7 +111,44 @@ class ServoAxis:
     def position_mm(self) -> float:
         if not self.connected:
             raise RuntimeError("伺服未连接")
+        if self.origin_count is None:
+            raise RuntimeError("servo logical zero has not been set")
+        return self._count2mm(self.dev.status["apos"] - self.origin_count)
+
+    @property
+    def raw_position_mm(self) -> float:
+        if not self.connected:
+            raise RuntimeError("servo is not connected")
         return self._count2mm(self.dev.status["apos"])
+
+    @property
+    def setup_offset_mm(self) -> float:
+        if not self.connected or self.boot_count is None:
+            raise RuntimeError("servo boot reference is unavailable")
+        return self._count2mm(self.dev.status["apos"] - self.boot_count)
+
+    def set_zero(self) -> None:
+        if not self.connected:
+            raise RuntimeError("servo is not connected")
+        if not self.dev.enable:
+            raise RuntimeError("servo must be explicitly enabled before setting zero")
+        self._wait_ready(self.dev)
+        self.origin_count = self.dev.status["apos"]
+
+    def jog_setup_mm(self, delta_mm: float) -> None:
+        """Small boot-relative manual move before the closed position is zeroed."""
+        if not self.connected:
+            raise RuntimeError("servo is not connected")
+        if not self.dev.enable:
+            raise RuntimeError("servo must be explicitly enabled before setup jog")
+        if self.origin_count is not None:
+            raise RuntimeError("setup jog is only available before servo zero")
+        if not math.isfinite(delta_mm) or not 0 < abs(delta_mm) <= 0.5:
+            raise ValueError("manual servo jog must be nonzero and at most 0.5 mm")
+        target = self.dev.status["apos"] + self._mm2count(delta_mm)
+        if abs(self._count2mm(target - self.boot_count)) > self.max_expansion_mm + 1e-6:
+            raise ValueError("manual servo jog exceeds boot-relative 10 mm guard")
+        self._move_raw(target, self.vel_mm_s)
 
     def move_mm(self, mm: float, vel_mm_s: float | None = None) -> None:
         """绝对定位（变距）。"""
@@ -107,11 +159,18 @@ class ServoAxis:
         velocity = self.vel_mm_s if vel_mm_s is None else vel_mm_s
         if not math.isfinite(velocity) or velocity <= 0:
             raise ValueError("servo velocity must be finite and positive")
+        if self.origin_count is None:
+            raise RuntimeError("servo logical zero has not been set")
+        target = self.origin_count + self._mm2count(mm)
+        self._move_raw(target, velocity)
+
+    def _move_raw(self, target: int, velocity: float) -> None:
+        if not self.dev.enable:
+            raise RuntimeError("servo must be enabled before motion")
         self._wait_ready(self.dev)
-        target = self._mm2count(mm)
         with self.dev.lock:
             self.dev.vel = self._mm2count(velocity)
-        self.dev.cmd_move(target)
+        self.dev.cmd_move_raw(target)
         deadline = time.monotonic() + self.timeout_s
         tolerance = max(1, self._mm2count(0.05))
         while time.monotonic() < deadline:
@@ -140,12 +199,21 @@ class ServoAxis:
             self.dev.reset_fault = True
 
     def disable(self) -> None:
+        self.origin_count = None
         if self.dev is not None:
             self.dev.enable = False
 
     def enable(self) -> None:
-        if self.dev is not None:
+        if not self.connected:
+            raise RuntimeError("servo is not connected")
+        with self.dev.lock:
             self.dev.enable = True
+        try:
+            self._wait_ready(self.dev)
+        except Exception:
+            with self.dev.lock:
+                self.dev.enable = False
+            raise
 
 
 class Cnc3D:
@@ -256,6 +324,7 @@ class InsertHead:
         self.serial_factory = serial_factory
         self.startup_delay_s = startup_delay_s
         self._stopped = False
+        self.zero_confirmed = False
         self.ser = None
 
     @property
@@ -266,10 +335,19 @@ class InsertHead:
         import serial  # 惰性导入
         factory = self.serial_factory or serial.Serial
         self.ser = factory(self.port, self.baud, timeout=0.1)
-        time.sleep(self.startup_delay_s)              # ESP32 若被 DTR 复位，等它打出帮助信息
-        self.ser.reset_input_buffer()
+        self.zero_confirmed = False
+        self._stopped = False
+        try:
+            time.sleep(self.startup_delay_s)  # Serial open may reset ESP32.
+            self.ser.reset_input_buffer()
+            self._send("v")
+            self._read_until(("ZPIN_HEAD_PROTOCOL=2",), 3.0)
+        except Exception as exc:
+            self.close()
+            raise RuntimeError("head firmware protocol 2 is required; flash and verify the current sketch") from exc
 
     def close(self) -> None:
+        self.zero_confirmed = False
         if self.ser is not None:
             try:
                 self.ser.close()
@@ -296,6 +374,8 @@ class InsertHead:
                 if "已紧急停止" in line:
                     self._stopped = True
                     raise RuntimeError("head stopped; position is untrusted")
+                if line.startswith(("错误:", "ERROR:")):
+                    raise RuntimeError(f"head firmware error: {line}")
                 if any(k in line for k in keywords):
                     return got
         raise TimeoutError(f"滑台应答超时（等待 {keywords}），已收: {got[-3:]}")
@@ -310,14 +390,15 @@ class InsertHead:
         return float(m.group(1))
 
     def move_mm(self, mm: float, timeout: float = 30.0) -> float:
-        """绝对移动并等待到位，返回实际目标值（软限位 0..travel）。"""
+        """Move within the confirmed signed window after manual zero."""
         if self._stopped:
             raise RuntimeError("head stopped; operator recovery is required")
         if self.motion is None:
             raise RuntimeError("head work window has not been confirmed")
-        if (not math.isfinite(mm) or not self.motion.work_min_mm <= mm <= self.motion.work_max_mm
-                or not 0 <= mm <= self.travel):
+        if not math.isfinite(mm) or not self.motion.work_min_mm <= mm <= self.motion.work_max_mm:
             raise ValueError("head target outside confirmed work window")
+        if not self.zero_confirmed:
+            raise RuntimeError("head physical standby and software zero have not been confirmed")
         self._send(f"{mm:.3f}")
         lines = self._read_until(("到达目标", "已紧急停止"), timeout)
         echoes = [re.search(r"移动到\s*([-\d.]+)\s*mm", line) for line in lines]
@@ -327,14 +408,18 @@ class InsertHead:
         return mm
 
     def zero(self) -> None:
+        self.zero_confirmed = False
         self._send("z")
         self._read_until(("设为 0mm",), 3.0)
+        self._stopped = False
+        self.zero_confirmed = True
 
     def enable(self) -> None:
         self._send("e")
         self._read_until(("电机使能",), 3.0)
 
     def disable(self) -> None:
+        self.zero_confirmed = False
         self._send("d")
         self._read_until(("电机释放",), 3.0)
 
@@ -345,5 +430,6 @@ class InsertHead:
     def stop(self) -> None:
         """急停（若滑台正在运动）。"""
         self._stopped = True
+        self.zero_confirmed = False
         if self.ser is not None:
             self.ser.write(b"q\n")

@@ -61,6 +61,10 @@ class Coordinator:
         for name, device in (("servo", self.servo), ("CNC", self.cnc), ("head", self.head)):
             if not device.connected:
                 raise RuntimeError(f"{name} is not connected")
+        if self.servo.origin_count is None:
+            raise RuntimeError("servo logical zero must be set at the mechanically closed position")
+        if not self.head.zero_confirmed:
+            raise RuntimeError("head software zero must be confirmed at physical standby")
         position = self.cnc.position()
         if position is None or abs(position[2] - self.scan_z_mm) > 0.05:
             raise RuntimeError("CNC must be at confirmed scan_z_mm before job")

@@ -23,3 +23,6 @@ desktop.ini
 # 将来若要减小仓库体积：git rm --cached 后另行决定，别直接删文件。
 third-party/drivers/*.exe
 third-party/docs/*.PDF
+
+# Native host-compiled firmware test artifact
+tests/firmware_head_harness.exe

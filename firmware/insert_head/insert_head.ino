@@ -10,7 +10,8 @@
  *   b1 / b0             -> 气阀B 开 / 关
  *   h  home             -> 回零，移动到 0mm
  *   z  zero             -> 把当前位置定义为 0mm
- *   t  test             -> 自动往返 0 -> 50 -> 0，用于测行程/校准导程
+ *   v  version          -> 查询上位机协议版本
+ *   t  test             -> 禁用的旧 50mm 测试命令
  *   s  status           -> 打印当前位置与参数
  *   e  enable           -> 使能电机（锁住）
  *   d  disable          -> 释放电机（可手动推动）
@@ -31,6 +32,8 @@
 #define MICROSTEPS           16     // 看盾板上的 MS0/MS1/MS2 跳线：全插=16细分，只MS0=2，只MS1=4...
 #define SCREW_LEAD_MM        1.0f   // ★ T6丝杆导程：常见 1 / 2 / 4 / 8 mm，查铭牌！
 #define TRAVEL_MM            50.0f  // 有效行程 50mm
+#define WORK_MIN_MM          -10.0f // 软件零位以下的最大下行，仍须先人工确认机械余量
+#define WORK_MAX_MM            0.0f // 软件零位设在待机位置；正方向不自动越过待机点
 
 // ===================== 3. 速度/加速度（可调）=====================
 #define MAX_SPEED  4000.0f   // 步/s
@@ -45,6 +48,8 @@
 const float STEPS_PER_MM = MOTOR_STEPS_PER_REV * MICROSTEPS / SCREW_LEAD_MM;
 
 AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
+bool stopLatched = false;
+bool zeroConfirmed = false;
 
 void setup() {
   Serial.begin(115200);
@@ -81,22 +86,33 @@ void handleCommand(String cmd) {
   if (cmd == "a" || cmd == "auto") {
     autoImplant();
   }
-  else if (cmd == "a1") { setValveA(true);  Serial.println("气阀A 打开"); }
+  else if (cmd == "a1") {
+    if (!zeroConfirmed || stopLatched) Serial.println("错误: 未人工确认机械待机位并 z 对零");
+    else { setValveA(true); Serial.println("气阀A 打开"); }
+  }
   else if (cmd == "a0") { setValveA(false); Serial.println("气阀A 关闭"); }
-  else if (cmd == "b1") { setValveB(true);  Serial.println("气阀B 打开"); }
+  else if (cmd == "b1") {
+    if (!zeroConfirmed || stopLatched) Serial.println("错误: 未人工确认机械待机位并 z 对零");
+    else { setValveB(true); Serial.println("气阀B 打开"); }
+  }
   else if (cmd == "b0") { setValveB(false); Serial.println("气阀B 关闭"); }
   else if (cmd == "h" || cmd == "home") {
     moveToMM(0);
   }
   else if (cmd == "z" || cmd == "zero") {
     stepper.setCurrentPosition(0);
+    stopLatched = false;
+    zeroConfirmed = true;
     Serial.println("当前位置已设为 0mm");
   }
+  else if (cmd == "v" || cmd == "version") {
+    Serial.println("ZPIN_HEAD_PROTOCOL=2");
+  }
   else if (cmd == "t" || cmd == "test") {
-    moveToMM(0);
-    moveToMM(TRAVEL_MM);
-    moveToMM(0);
-    Serial.println("往返测试完成");
+    Serial.println("错误: 50mm 往返测试已禁用，不能用于当前机构");
+  }
+  else if (cmd == "q" || cmd == "stop") {
+    emergencyStop();
   }
   else if (cmd == "s" || cmd == "status") {
     printStatus();
@@ -112,42 +128,86 @@ void handleCommand(String cmd) {
     moveToMM(mm);
   }
   else {
-    Serial.println("未知命令，输入 h 查看帮助");
+    Serial.println("错误: 未知命令，输入 s 查看状态");
   }
+}
+
+// q 的回执仅在减速完成、双阀关闭后发出；后续动作保持锁止直至人工 z 对零。
+void emergencyStop() {
+  stepper.stop();
+  while (stepper.distanceToGo() != 0) stepper.run();
+  setValveA(false);
+  setValveB(false);
+  stopLatched = true;
+  zeroConfirmed = false;
+  Serial.println("已紧急停止！位置已不准确，请重新 z 回零");
+}
+
+bool serviceStopCommand() {
+  if (!Serial.available()) return false;
+  String c = Serial.readStringUntil('\n');
+  c.trim();
+  c.toLowerCase();
+  if (c == "q" || c == "stop") {
+    emergencyStop();
+    return true;
+  }
+  Serial.println("忙碌中，仅接受 q 急停");
+  return false;
+}
+
+bool waitValveDelay(int milliseconds) {
+  for (int elapsed = 0; elapsed < milliseconds; elapsed += 10) {
+    if (serviceStopCommand() || stopLatched) return false;
+    delay(milliseconds - elapsed < 10 ? milliseconds - elapsed : 10);
+  }
+  return !stopLatched;
 }
 
 // ============ 自动植入流程 ============
 // 1.开阀A -> 2.向下移动 -> 3.关阀A -> 4.开阀B -> 5.向上移动 -> 6.关阀B
 void autoImplant() {
+  if (stopLatched || !zeroConfirmed) {
+    Serial.println("错误: 未人工确认机械待机位并 z 对零");
+    return;
+  }
   Serial.println("\n===== 开始自动植入流程 =====");
 
   // 1. 打开气阀A
   setValveA(true);
   Serial.println("1. 气阀A 打开");
-  delay(VALVE_DELAY_MS);
+  if (!waitValveDelay(VALVE_DELAY_MS)) return;
 
   // 2. 滑台向下移动
   Serial.printf("2. 滑台向下移动 %.1f mm\n", MOVE_DOWN_MM);
-  moveByMM(-MOVE_DOWN_MM);   // 负号=向下（若方向反了，把 - 改成 +）
+  if (!moveByMM(-MOVE_DOWN_MM)) {
+    setValveA(false); setValveB(false);
+    Serial.println("错误: 下行未完成，流程中止");
+    return;
+  }
 
   // 3. 关闭气阀A
   setValveA(false);
   Serial.println("3. 气阀A 关闭");
-  delay(VALVE_DELAY_MS);
+  if (!waitValveDelay(VALVE_DELAY_MS)) return;
 
   // 4. 打开气阀B
   setValveB(true);
   Serial.println("4. 气阀B 打开");
-  delay(VALVE_DELAY_MS);
+  if (!waitValveDelay(VALVE_DELAY_MS)) return;
 
   // 5. 滑台向上移动
   Serial.printf("5. 滑台向上移动 %.1f mm\n", MOVE_UP_MM);
-  moveByMM(+MOVE_UP_MM);     // 正号=向上（若方向反了，把 + 改成 -）
+  if (!moveByMM(+MOVE_UP_MM)) {
+    setValveA(false); setValveB(false);
+    Serial.println("错误: 上行未完成，流程中止");
+    return;
+  }
 
   // 6. 关闭气阀B
   setValveB(false);
   Serial.println("6. 气阀B 关闭");
-  delay(VALVE_DELAY_MS);
+  if (!waitValveDelay(VALVE_DELAY_MS)) return;
 
   Serial.println("===== 自动植入流程完成 =====\n");
 }
@@ -160,15 +220,21 @@ float currentPosMM() {
   return stepper.currentPosition() / STEPS_PER_MM;
 }
 
-// 相对移动 deltaMM（可正可负），最终仍受 0~50mm 软限位约束
-void moveByMM(float deltaMM) {
-  moveToMM(currentPosMM() + deltaMM);
+// 相对移动 deltaMM（可正可负），最终受有符号工作窗口约束
+bool moveByMM(float deltaMM) {
+  return moveToMM(currentPosMM() + deltaMM);
 }
 
-// 移动到绝对位置(mm)，带 0~50mm 软限位
-void moveToMM(float targetMM) {
-  if (targetMM < 0) targetMM = 0;
-  if (targetMM > TRAVEL_MM) targetMM = TRAVEL_MM;
+// 移动到绝对位置(mm)，带有符号工作窗口限位
+bool moveToMM(float targetMM) {
+  if (stopLatched || !zeroConfirmed) {
+    Serial.println("错误: 未人工确认机械待机位并 z 对零");
+    return false;
+  }
+  if (targetMM < WORK_MIN_MM || targetMM > WORK_MAX_MM) {
+    Serial.println("错误: 目标超出已配置工作区间，不执行运动");
+    return false;
+  }
 
   long targetSteps = (long)(targetMM * STEPS_PER_MM);
   stepper.moveTo(targetSteps);
@@ -177,28 +243,18 @@ void moveToMM(float targetMM) {
 
   // 阻塞直到到达；期间可输入 q 急停
   while (stepper.distanceToGo() != 0) {
-    if (Serial.available()) {
-      String c = Serial.readStringUntil('\n');
-      c.trim();
-      c.toLowerCase();
-      if (c == "q" || c == "stop") {
-        stepper.stop();          // 立即停止（会丢位置）
-        Serial.println("已紧急停止！位置已不准确，请重新 z 回零");
-        break;
-      }
-    }
+    if (serviceStopCommand()) return false;
     stepper.run();
   }
-
-  if (stepper.distanceToGo() == 0)
-    Serial.println("到达目标");
+  Serial.println("到达目标");
+  return true;
 }
 
 void printStatus() {
   float posMM = stepper.currentPosition() / STEPS_PER_MM;
   Serial.printf("当前位置: %.2f mm  (步数 %ld)\n", posMM, stepper.currentPosition());
-  Serial.printf("导程 %.2f mm/圈, 每毫米 %ld 步, 行程 0~%.0f mm\n",
-                SCREW_LEAD_MM, (long)STEPS_PER_MM, TRAVEL_MM);
+  Serial.printf("导程 %.2f mm/圈, 每毫米 %ld 步, 工作窗口 %.1f~%.1f mm\n",
+                SCREW_LEAD_MM, (long)STEPS_PER_MM, WORK_MIN_MM, WORK_MAX_MM);
   Serial.printf("气阀A: %s | 气阀B: %s\n",
                 digitalRead(VALVE_A_PIN) ? "开" : "关",
                 digitalRead(VALVE_B_PIN) ? "开" : "关");
@@ -211,13 +267,14 @@ void enableMotor() {
 
 void disableMotor() {
   digitalWrite(EN_PIN, HIGH);  // 高电平=释放
+  zeroConfirmed = false;
   Serial.println("电机释放（可手动推动滑台）");
 }
 
 void printHelp() {
   Serial.println("\n===== GX28 丝杆滑台 + 双气阀控制 =====");
-  Serial.printf("导程 %.1f mm/圈，每毫米 %ld 步，行程 0~%.0f mm\n",
-                SCREW_LEAD_MM, (long)STEPS_PER_MM, TRAVEL_MM);
+  Serial.printf("导程 %.1f mm/圈，每毫米 %ld 步，工作窗口 %.1f~%.1f mm\n",
+                SCREW_LEAD_MM, (long)STEPS_PER_MM, WORK_MIN_MM, WORK_MAX_MM);
   Serial.println("命令: 数字(mm)=移动 | a=自动植入 | a1/a0=阀A开关 | b1/b0=阀B开关");
-  Serial.println("      h=回零 | z=设零 | t=往返测试 | s=状态 | e=使能 | d=释放 | q=急停");
+  Serial.println("      h=回软件零 | z=人工确认后设零 | v=协议版本 | s=状态 | e=使能 | d=释放 | q=急停");
 }
