@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT))
 
 from master.coordinator import Coordinator, RunState
 from master.model import HeadMotion, JobSpec, MachineGeometry
+from master.operator_gate import OperatorGate
 from master.planner import plan_grid
 from master.simulated import SimulationRig
 
@@ -46,7 +47,8 @@ def run_simulation(job: JobSpec, *, inject_failure: bool = False) -> int:
     rig.servo.set_zero()
     rig.head.zero()
     coordinator = Coordinator(rig.servo, rig.cnc, rig.head, motion,
-                              scan_z_mm=0, operator_confirmed=True, valve_delay_s=0)
+                              scan_z_mm=0, operator_confirmed=True, valve_delay_s=0,
+                              confirm_next=lambda done, total, cancel: not cancel.is_set())
     _print_plan(job, plan)
     result = coordinator.run(plan)
     print(f"{result.state.name}: {result.completed_placements}/{result.total_placements} placements"
@@ -113,6 +115,7 @@ def _read_stop_commands(commands: queue.Queue[str]) -> None:
         try:
             commands.put(input("运行中，输入 ! 急停 > ").strip())
         except EOFError:
+            commands.put("EOF")
             return
 
 
@@ -169,9 +172,11 @@ def run_live(config_path: Path, confirmed: bool,
                 limits=(cn["x_max"], cn["y_max"], cn["z_max"]))
     head = InsertHead(port=hd["port"], baud=hd["baud"],
                       travel_mm=hd["travel_mm"], motion=motion)
+    gate = OperatorGate()
     coordinator = Coordinator(servo, cnc, head, motion, scan_z_mm=scan_z,
                               operator_confirmed=confirmed,
-                              valve_delay_s=cfg["cycle"]["valve_delay_ms"] / 1000)
+                              valve_delay_s=cfg["cycle"]["valve_delay_ms"] / 1000,
+                              confirm_next=gate.wait_for_ready)
     try:
         print("连接设备前请先确认滑台位于安全待机点，伺服机构有点动余量；"
               "上电显示 0 不代表机械零位。")
@@ -184,7 +189,8 @@ def run_live(config_path: Path, confirmed: bool,
         if not _prepare_live_zeros(servo, head):
             print("已取消，未开始自动植入。")
             return 1
-        print("实时运行：按 Enter 后输入 ! 可请求三路停止。")
+        print("实时运行：输入 ! 可请求三路停止。每次五针退回且 B 阀排气后，"
+              "请剪丝并按屏幕提示输入 READY 代码，才会移动到下一落点。")
         commands: queue.Queue[str] = queue.Queue()
         reader = threading.Thread(target=_read_stop_commands, args=(commands,), daemon=True)
         reader.start()
@@ -201,8 +207,10 @@ def run_live(config_path: Path, confirmed: bool,
         while worker.is_alive():
             try:
                 command = commands.get(timeout=0.1)
-                if command == "!":
+                if command in ("!", "EOF"):
                     coordinator.request_stop()
+                elif command.upper().startswith("READY") and not gate.submit(command):
+                    print("确认码无效或当前未等待剪丝；下一落点仍未放行。")
             except queue.Empty:
                 pass
             except KeyboardInterrupt:

@@ -6,6 +6,7 @@ import math
 import threading
 from dataclasses import dataclass
 from enum import Enum
+from typing import Callable
 
 from master.model import HeadMotion
 from master.planner import GridPlan
@@ -14,6 +15,7 @@ from master.planner import GridPlan
 class RunState(Enum):
     READY = "ready"
     RUNNING = "running"
+    WAITING_OPERATOR = "waiting_operator"
     COMPLETE = "complete"
     STOPPED = "stopped"
     FAULT = "fault"
@@ -33,7 +35,8 @@ class _StopRequested(Exception):
 
 class Coordinator:
     def __init__(self, servo, cnc, head, motion: HeadMotion, *, scan_z_mm: float,
-                 operator_confirmed: bool, valve_delay_s: float = 0.5):
+                 operator_confirmed: bool, valve_delay_s: float = 0.5,
+                 confirm_next: Callable[[int, int, threading.Event], bool] | None = None):
         if not math.isfinite(scan_z_mm) or not math.isfinite(valve_delay_s) or valve_delay_s < 0:
             raise ValueError("scan_z_mm and valve_delay_s must be finite; delay cannot be negative")
         self.servo, self.cnc, self.head = servo, cnc, head
@@ -41,6 +44,7 @@ class Coordinator:
         self.scan_z_mm = scan_z_mm
         self.operator_confirmed = operator_confirmed
         self.valve_delay_s = valve_delay_s
+        self.confirm_next = confirm_next
         self.state = RunState.READY
         self.cancel_event = threading.Event()
         self._stop_lock = threading.Lock()
@@ -118,6 +122,8 @@ class Coordinator:
     def run(self, plan: GridPlan) -> RunResult:
         if self.state is not RunState.READY:
             raise RuntimeError("coordinator cannot run twice or resume after stop")
+        if len(plan.placements) > 1 and self.confirm_next is None:
+            raise RuntimeError("operator must confirm each next placement after cutting and reloading wire")
         self._check_ready()
         completed = 0
         self.state = RunState.RUNNING
@@ -125,12 +131,19 @@ class Coordinator:
             self._check_cancel()
             self.servo.move_mm(plan.servo_target_mm)
             self._check_cancel()
-            for placement in plan.placements:
+            for index, placement in enumerate(plan.placements):
                 self._check_cancel()
                 self.cnc.move_to(placement.cnc_x_mm, placement.cnc_y_mm, self.scan_z_mm)
                 self._check_cancel()
                 self._cycle_one()
                 completed += 1
+                if index + 1 < len(plan.placements):
+                    self.state = RunState.WAITING_OPERATOR
+                    self._check_cancel()
+                    if not self.confirm_next(completed, len(plan.placements), self.cancel_event):
+                        raise _StopRequested()
+                    self._check_cancel()
+                    self.state = RunState.RUNNING
             self.state = RunState.COMPLETE
             return RunResult(self.state, completed, len(plan.placements))
         except _StopRequested:
