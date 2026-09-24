@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """三个执行器的统一封装：
   ServoAxis  —— 变距模组（SV630N 伺服, EtherCAT, 复用 sv630n_pc.py 的类）
-  Cnc3D      —— 三维模组 X/Y/Z（ESP32 Grbl/FluidNC, 串口, 复用 3-dim-module 库）
-  InsertHead —— 植入滑台 GX28 + 双气阀（ESP32 自研协议, 见 Untitled-1.cpp）
+  Cnc3D      —— 三维模组 X/Y/Z（ESP32 Grbl/FluidNC, 串口, 复用 cnc3d 库）
+  InsertHead —— 植入滑台 GX28 + 双气阀（ESP32 自研协议, 见 firmware/insert_head/insert_head.ino）
 对外全部用 mm 单位，count 换算只在 ServoAxis 内部做。
 """
 from __future__ import annotations
@@ -15,8 +15,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))                      # 让 sv630n_pc 可导入
-sys.path.insert(0, str(ROOT / "3-dim-module" / "src"))  # 让 cnc_grbl 可导入
+    sys.path.insert(0, str(ROOT / "servo"))            # 让 sv630n_pc 可导入
+sys.path.insert(0, str(ROOT / "cnc3d" / "src"))        # 让 cnc_grbl 可导入
 
 
 class ServoAxis:
@@ -156,7 +156,7 @@ class Cnc3D:
 
 
 class InsertHead:
-    """植入滑台 + 双气阀。协议（Untitled-1.cpp）：数字=绝对mm、z/e/d/a1/a0/b1/b0/q/s"""
+    """植入滑台 + 双气阀。协议（firmware/insert_head/insert_head.ino）：数字=绝对mm、z/e/d/a1/a0/b1/b0/q/s"""
 
     def __init__(self, port: str = "COM7", baud: int = 115200, travel_mm: float = 50.0):
         self.port = port

@@ -1,0 +1,23 @@
+# conda 环境定义 —— 用法：
+#     conda env create -f environment.yml
+#     conda activate zpin
+#
+# ★ python 版本被钉死在 3.13，不要改成别的版本：
+#   pysoem 的 Windows wheel 只有 cp313（pysoem-1.1.13-cp313-cp313-win_amd64.whl，
+#   147KB，预编译，不需要 C 编译器）。3.12 及以下的 wheel 在 win_amd64 上都不存在，
+#   conda base 的 3.14 同样装不上。详见 ENVIRONMENT.md。
+#
+# conda 只管 Python 解释器本身；pip 依赖统一在 requirements.txt 里维护，
+# 这样 conda 与纯 pip 两条路径共用同一份依赖清单。
+
+name: zpin
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.13
+  - pip
+
+  - pip:
+      - -r requirements.txt

@@ -1,1 +1,16 @@
+# 换行符策略 —— 防止跨机器 checkout 后 Windows 批处理失效
+#
+# cmd.exe 解析 .bat 时要求 CRLF。如果文件被以 LF 存进仓库、又在别的机器上
+# 原样 checkout 出来，批处理会出现"每行开头少一个字符"的诡异报错
+# （例如 set PYTHONUTF8=1 变成识别不了 ONUTF8）。
+# 这里把 .bat/.cmd 显式钉成 CRLF，避免依赖各人本地的 core.autocrlf 设置。
+
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+# 二进制文件不做换行转换
+*.exe  binary
+*.PDF  binary
+*.jpg  binary
+*.png  binary
+*.ino  -text
 third-party/docs/*.PDF filter=lfs diff=lfs merge=lfs -text

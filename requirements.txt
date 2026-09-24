@@ -1,0 +1,14 @@
+# z-pin-control PC 端运行依赖
+#
+# ★ Python 必须是 3.13 —— 理由见 ENVIRONMENT.md：
+#   pysoem 在 Windows 上只有 cp313 一个预编译 wheel，3.10/3.11/3.12/3.14
+#   都没有可用的分发包（装不上，且本机没有 C 编译器）。
+#
+# 安装：pip install -r requirements.txt
+
+# EtherCAT 主站（变距模组 / SV630N 伺服）
+# 需要系统先装 Npcap（勾选 WinPcap 兼容模式），否则运行期报找不到 wpcap.dll。
+pysoem==1.1.13
+
+# 串口（三维模组 COM9 + 植入滑台 COM7）
+pyserial>=3.5

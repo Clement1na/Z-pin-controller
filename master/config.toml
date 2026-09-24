@@ -26,7 +26,7 @@ z_max = 50.0
 [head]
 port = "COM7"     # ★ 滑台 ESP32 的串口号
 baud = 115200
-travel_mm = 50.0  # 有效行程（与 Untitled-1.cpp 中 TRAVEL_MM 一致）
+travel_mm = 50.0  # 有效行程（与 insert_head.ino 中 TRAVEL_MM 一致）
 
 # ---------- 单点植入流程参数 ----------
 [cycle]

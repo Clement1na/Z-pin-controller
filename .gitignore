@@ -1,0 +1,25 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---------- 打包产物（PyInstaller，见 ENVIRONMENT.md 的"打包"一节）----------
+build/
+dist/
+*.spec
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# ---------- 第三方二进制与手册 ----------
+# 注意：这两个文件在 .gitignore 生效之前就已经被 git 跟踪了，
+# 所以本规则对它们**当前无效**（快照里仍带着它们）。
+# 将来若要减小仓库体积：git rm --cached 后另行决定，别直接删文件。
+third-party/drivers/*.exe
+third-party/docs/*.PDF
