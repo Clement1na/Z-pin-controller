@@ -6,13 +6,14 @@ import argparse
 import queue
 import sys
 import threading
-import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from master.coordinator import Coordinator, RunState
+from master.local_config import load_merged, local_path_for, write_local
 from master.model import HeadMotion, JobSpec, MachineGeometry
 from master.operator_gate import OperatorGate
 from master.planner import plan_grid
@@ -23,6 +24,9 @@ def default_config_path() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent / "config.toml"
     return Path(__file__).resolve().parent / "config.toml"
+
+
+JOB_KEYS = ("width_mm", "height_mm", "spacing_mm", "plate_thickness_mm")
 
 
 def _known_geometry() -> MachineGeometry:
@@ -61,11 +65,8 @@ def _read_live_configuration(path: Path, confirmed: bool,
                              job_overrides: dict[str, float] | None = None):
     if not confirmed:
         raise ValueError("configuration: --confirm-datum is required for live mode")
-    try:
-        with path.open("rb") as stream:
-            cfg = tomllib.load(stream)
-    except OSError as exc:
-        raise ValueError(f"configuration: cannot read {path}: {exc}") from exc
+    # 模板 + 同级的 config.local.toml（向导生成）。本机文件不存在时完全等价于只读模板。
+    cfg = load_merged(path)
 
     def required(section: str, key: str):
         value = cfg.get(section, {}).get(key)
@@ -73,13 +74,14 @@ def _read_live_configuration(path: Path, confirmed: bool,
             raise ValueError(f"configuration: [{section}] {key} is required")
         return value
 
-    job_defaults = {key: required("job", key) for key in
-                    ("width_mm", "height_mm", "spacing_mm", "plate_thickness_mm")}
     overrides = job_overrides or {}
-    unknown = set(overrides) - set(job_defaults)
+    unknown = set(overrides) - set(JOB_KEYS)
     if unknown:
         raise ValueError(f"configuration: unknown job override {', '.join(sorted(unknown))}")
-    job = JobSpec(**(job_defaults | overrides))
+    # 模板刻意注释掉了 [job]：明确传入的覆盖项可以补齐缺失的键，没传的仍然必须来自配置。
+    job_defaults = {key: overrides[key] if key in overrides else required("job", key)
+                    for key in JOB_KEYS}
+    job = JobSpec(**job_defaults)
     geometry = _known_geometry()
     lead = required("servo", "lead_mm")
     if abs(lead - geometry.servo_lead_mm) > 1e-4:
@@ -159,85 +161,141 @@ def _prepare_live_zeros(servo, head) -> bool:
             print(f"设置失败：{exc}")
 
 
-def run_live(config_path: Path, confirmed: bool,
-             job_overrides: dict[str, float] | None = None) -> int:
-    cfg, job, geometry, motion, scan_z, plan = _read_live_configuration(
-        config_path, confirmed, job_overrides)
+@dataclass
+class LiveDevices:
+    servo: object
+    cnc: object
+    head: object
+
+
+def _open_live_devices(cfg: dict, geometry: MachineGeometry, motion: HeadMotion) -> LiveDevices:
+    """只构造对象，不碰硬件。连接失败前不会有任何动作。"""
     from master.devices import Cnc3D, InsertHead, ServoAxis
 
     sv, cn, hd = cfg["servo"], cfg["cnc3d"], cfg["head"]
-    servo = ServoAxis(adapter=sv["adapter"], lead_mm=geometry.servo_lead_mm,
-                      counts_per_rev=sv["counts_per_rev"], vel_mm_s=sv["vel_mm_s"])
-    cnc = Cnc3D(port=cn["port"], baud=cn["baud"], feed=cn["feed"],
-                limits=(cn["x_max"], cn["y_max"], cn["z_max"]))
-    head = InsertHead(port=hd["port"], baud=hd["baud"],
-                      travel_mm=hd["travel_mm"], motion=motion)
-    gate = OperatorGate()
-    coordinator = Coordinator(servo, cnc, head, motion, scan_z_mm=scan_z,
-                              operator_confirmed=confirmed,
-                              valve_delay_s=cfg["cycle"]["valve_delay_ms"] / 1000,
-                              confirm_next=gate.wait_for_ready)
-    try:
-        print("连接设备前请先确认滑台位于安全待机点，伺服机构有点动余量；"
-              "上电显示 0 不代表机械零位。")
-        head.connect()
-        cnc.connect()
-        servo.connect()
-        _print_plan(job, plan)
-        print(f"连接后状态：CNC WPos={cnc.position()}，滑台软件读数={head.position_mm():.3f} mm；"
-              f"预期扫描 Z={scan_z:g} mm。读数不能证明机械零位。")
-        if not _prepare_live_zeros(servo, head):
-            print("已取消，未开始自动植入。")
-            return 1
-        print("实时运行：输入 ! 可请求三路停止。每次五针退回且 B 阀排气后，"
-              "请剪丝并按屏幕提示输入 READY 代码，才会移动到下一落点。")
-        commands: queue.Queue[str] = queue.Queue()
-        reader = threading.Thread(target=_read_stop_commands, args=(commands,), daemon=True)
-        reader.start()
-        holder: list = []
+    return LiveDevices(
+        servo=ServoAxis(adapter=sv["adapter"], lead_mm=geometry.servo_lead_mm,
+                        counts_per_rev=sv["counts_per_rev"], vel_mm_s=sv["vel_mm_s"]),
+        cnc=Cnc3D(port=cn["port"], baud=cn["baud"], feed=cn["feed"],
+                  limits=(cn["x_max"], cn["y_max"], cn["z_max"])),
+        head=InsertHead(port=hd["port"], baud=hd["baud"],
+                        travel_mm=hd["travel_mm"], motion=motion))
 
-        def execute() -> None:
-            try:
-                holder.append(coordinator.run(plan))
-            except Exception as exc:
-                holder.append(exc)
 
-        worker = threading.Thread(target=execute, daemon=True)
-        worker.start()
-        while worker.is_alive():
-            try:
-                command = commands.get(timeout=0.1)
-                if command in ("!", "EOF"):
-                    coordinator.request_stop()
-                elif command.upper().startswith("READY") and not gate.submit(command):
-                    print("确认码无效或当前未等待剪丝；下一落点仍未放行。")
-            except queue.Empty:
-                pass
-            except KeyboardInterrupt:
-                coordinator.request_stop()
-        worker.join()
-        if not holder or isinstance(holder[0], Exception):
-            raise RuntimeError(f"live coordinator failed before motion: {holder[0] if holder else 'no result'}")
-        result = holder[0]
-        print(f"{result.state.name}: {result.completed_placements}/{result.total_placements} placements"
-              + (f"; {result.error}" if result.error else ""))
-        return 0 if result.state is RunState.COMPLETE else 1
-    finally:
-        if head.connected:
-            for which in ("a", "b"):
-                try:
-                    head.valve(which, False)
-                except Exception:
-                    pass
+def _connect_live_devices(devices: LiveDevices) -> None:
+    print("连接设备前请先确认滑台位于安全待机点，伺服机构有点动余量；"
+          "上电显示 0 不代表机械零位。")
+    for label, device in (("GX28 滑台", devices.head),
+                          ("CNC 三维模组", devices.cnc),
+                          ("SV630N 伺服", devices.servo)):
         try:
-            servo.disable()
-        except Exception:
-            pass
-        for device in (head, cnc, servo):
+            device.connect()
+        except Exception as exc:
+            # 串口/网卡打不开是操作员最可能遇到的失败；不该让他看到 Python 堆栈。
+            raise RuntimeError(f"{label} 连接失败：{exc}") from exc
+
+
+def _close_live_devices(devices: LiveDevices) -> None:
+    if devices.head.connected:
+        for which in ("a", "b"):
             try:
-                device.close()
+                devices.head.valve(which, False)
             except Exception:
                 pass
+    try:
+        devices.servo.disable()
+    except Exception:
+        pass
+    for device in (devices.head, devices.cnc, devices.servo):
+        try:
+            device.close()
+        except Exception:
+            pass
+
+
+def _make_reporter(job, plan, motion, scan_z, results_dir):
+    if results_dir is None:
+        return None
+    from master.reporting import RunReporter
+    try:
+        return RunReporter(job=job, plan=plan, machine=_known_geometry(), motion=motion,
+                           scan_z_mm=scan_z, out_dir=results_dir)
+    except Exception as exc:
+        print(f"警告：无法创建结果文件（{exc}），本次运行不记录。")
+        return None
+
+
+def _execute_live_job(cfg: dict, job: JobSpec, motion: HeadMotion, scan_z: float,
+                      plan, devices: LiveDevices, *, results_dir: Path | None = None) -> int:
+    gate = OperatorGate()
+    reporter = _make_reporter(job, plan, motion, scan_z, results_dir)
+    coordinator = Coordinator(devices.servo, devices.cnc, devices.head, motion,
+                              scan_z_mm=scan_z, operator_confirmed=True,
+                              valve_delay_s=cfg["cycle"]["valve_delay_ms"] / 1000,
+                              confirm_next=gate.wait_for_ready,
+                              progress=reporter)
+    print("实时运行：输入 ! 可请求三路停止。每次五针退回且 B 阀排气后，"
+          "请剪丝并按屏幕提示输入 READY 代码，才会移动到下一落点。")
+    commands: queue.Queue[str] = queue.Queue()
+    reader = threading.Thread(target=_read_stop_commands, args=(commands,), daemon=True)
+    reader.start()
+    holder: list = []
+
+    def execute() -> None:
+        try:
+            holder.append(coordinator.run(plan))
+        except Exception as exc:
+            holder.append(exc)
+
+    worker = threading.Thread(target=execute, daemon=True)
+    worker.start()
+    while worker.is_alive():
+        try:
+            command = commands.get(timeout=0.1)
+            if command in ("!", "EOF"):
+                coordinator.request_stop()
+            elif command.upper().startswith("READY") and not gate.submit(command):
+                print("确认码无效或当前未等待剪丝；下一落点仍未放行。")
+        except queue.Empty:
+            pass
+        except KeyboardInterrupt:
+            coordinator.request_stop()
+    worker.join()
+    if not holder or isinstance(holder[0], Exception):
+        raise RuntimeError(f"live coordinator failed before motion: {holder[0] if holder else 'no result'}")
+    result = holder[0]
+    print(f"{result.state.name}: {result.completed_placements}/{result.total_placements} placements"
+          + (f"; {result.error}" if result.error else ""))
+    for message in coordinator.progress_errors:
+        print(f"警告：结果记录失败：{message}")
+    if reporter is not None:
+        artifacts = reporter.finish(result)
+        if artifacts is not None:
+            print(f"结果已保存：{artifacts[0]}；摘要 {artifacts[1]}")
+    return 0 if result.state is RunState.COMPLETE else 1
+
+
+def run_live(config_path: Path, confirmed: bool,
+             job_overrides: dict[str, float] | None = None, *,
+             results_dir: Path | None = None) -> int:
+    cfg, job, geometry, motion, scan_z, plan = _read_live_configuration(
+        config_path, confirmed, job_overrides)
+    devices = _open_live_devices(cfg, geometry, motion)
+    if results_dir is None:
+        results_dir = Path(config_path).parent / "runs"
+    try:
+        _connect_live_devices(devices)
+        _print_plan(job, plan)
+        print(f"连接后状态：CNC WPos={devices.cnc.position()}，"
+              f"滑台软件读数={devices.head.position_mm():.3f} mm；"
+              f"预期扫描 Z={scan_z:g} mm。读数不能证明机械零位。")
+        if not _prepare_live_zeros(devices.servo, devices.head):
+            print("已取消，未开始自动植入。")
+            return 1
+        return _execute_live_job(cfg, job, motion, scan_z, plan, devices,
+                                 results_dir=results_dir)
+    finally:
+        _close_live_devices(devices)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -254,6 +312,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, default=default_config_path())
     parser.add_argument("--confirm-datum", action="store_true",
                         help="confirm manual CNC work zero, safe scan height and head datum")
+    parser.add_argument("--results-dir", type=Path,
+                        help="directory for the per-placement CSV and JSON summary")
     args = parser.parse_args(argv)
     try:
         if args.live:
@@ -261,7 +321,14 @@ def main(argv: list[str] | None = None) -> int:
                          (("width_mm", args.width), ("height_mm", args.height),
                           ("spacing_mm", args.spacing), ("plate_thickness_mm", args.thickness))
                          if value is not None}
-            return run_live(args.config, args.confirm_datum, job_overrides=overrides)
+            if not args.confirm_datum:
+                # 没有 --confirm-datum 就进交互向导；分派放在这里而不是 run_live 里，
+                # 否则 run_live(confirmed=False) 的"连接前拒绝"语义会被向导吞掉。
+                from master.wizard import run_setup_wizard
+                return run_setup_wizard(args.config, job_overrides=overrides,
+                                        results_dir=args.results_dir)
+            extra = {} if args.results_dir is None else {"results_dir": args.results_dir}
+            return run_live(args.config, args.confirm_datum, job_overrides=overrides, **extra)
         job = JobSpec(args.width if args.width is not None else 360,
                       args.height if args.height is not None else 360,
                       args.spacing if args.spacing is not None else 4,

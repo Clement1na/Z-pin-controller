@@ -36,7 +36,8 @@ class _StopRequested(Exception):
 class Coordinator:
     def __init__(self, servo, cnc, head, motion: HeadMotion, *, scan_z_mm: float,
                  operator_confirmed: bool, valve_delay_s: float = 0.5,
-                 confirm_next: Callable[[int, int, threading.Event], bool] | None = None):
+                 confirm_next: Callable[[int, int, threading.Event], bool] | None = None,
+                 progress=None):
         if not math.isfinite(scan_z_mm) or not math.isfinite(valve_delay_s) or valve_delay_s < 0:
             raise ValueError("scan_z_mm and valve_delay_s must be finite; delay cannot be negative")
         self.servo, self.cnc, self.head = servo, cnc, head
@@ -45,12 +46,27 @@ class Coordinator:
         self.operator_confirmed = operator_confirmed
         self.valve_delay_s = valve_delay_s
         self.confirm_next = confirm_next
+        self.progress = progress
+        self.progress_errors: list[str] = []
         self.state = RunState.READY
         self.cancel_event = threading.Event()
         self._stop_lock = threading.Lock()
         self._stop_errors: list[str] = []
         for device in (self.servo, self.cnc, self.head):
             device.cancel_event = self.cancel_event
+
+    def _notify(self, method: str, *args, **kwargs) -> None:
+        """进度回调绝不能打断机器：记录失败，运行继续。
+
+        但也不能静默吞掉——失败的次数和原因留在 progress_errors 里给 CLI 打印，
+        否则一个坏掉的记录器会让整份结果文件凭空消失。
+        """
+        if self.progress is None:
+            return
+        try:
+            getattr(self.progress, method)(*args, **kwargs)
+        except Exception as exc:
+            self.progress_errors.append(f"{method}: {exc}")
 
     def _check_cancel(self) -> None:
         if self.cancel_event.is_set():
@@ -133,10 +149,19 @@ class Coordinator:
             self._check_cancel()
             for index, placement in enumerate(plan.placements):
                 self._check_cancel()
-                self.cnc.move_to(placement.cnc_x_mm, placement.cnc_y_mm, self.scan_z_mm)
-                self._check_cancel()
-                self._cycle_one()
+                total = len(plan.placements)
+                self._notify("placement_started", index, total, placement)
+                try:
+                    self.cnc.move_to(placement.cnc_x_mm, placement.cnc_y_mm, self.scan_z_mm)
+                    self._check_cancel()
+                    self._cycle_one()
+                except BaseException as exc:
+                    # 落点中途失败或急停：必须留下一行，否则"跑到哪了"无从查起。
+                    self._notify("placement_finished", index, total, placement,
+                                 ok=False, error=str(exc) or type(exc).__name__)
+                    raise
                 completed += 1
+                self._notify("placement_finished", index, total, placement, ok=True, error=None)
                 if index + 1 < len(plan.placements):
                     self.state = RunState.WAITING_OPERATOR
                     self._check_cancel()

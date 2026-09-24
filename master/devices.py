@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import math
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -53,9 +54,13 @@ class ServoAxis:
             if not math.isclose(self.lead_mm, LEAD_MM, rel_tol=1e-6):
                 raise ValueError("servo lead_mm differs from calibrated LEAD_MM")
             factory = Sv630n
+            # 配置里存的是人类可读的网卡描述；只有真实硬件路径才解析成 pysoem 设备名。
+            # 注入 device_factory 的测试用的是 "fake-wired" 这类假值，绝不能去查真实网卡。
+            adapter = resolve_adapter(self.adapter)
         else:
             factory = self.device_factory
-        dev = factory(self.adapter)
+            adapter = self.adapter
+        dev = factory(adapter)
         try:
             dev.open()
             dev.running = True
@@ -434,3 +439,146 @@ class InsertHead:
         self.zero_confirmed = False
         if self.ser is not None:
             self.ser.write(b"q\n")
+
+
+# ---------------------------------------------------------------- 枚举与解析
+# 向导用。放在本模块是因为这里已经是 pysoem 和 pyserial 的唯一惰性导入边界，
+# 而 resolve_adapter 必须能从 ServoAxis.connect() 直接调用。
+# 纯函数都接受注入的枚举器，所以无硬件也能测。
+
+@dataclass(frozen=True)
+class SerialCandidate:
+    device: str
+    description: str
+    hwid: str
+    is_usb: bool
+    reject_reason: str | None
+
+
+@dataclass(frozen=True)
+class NicCandidate:
+    index: int
+    description: str
+    name: str
+    reject_reason: str | None
+
+
+# 顺序有意义：先匹配更具体的原因，"Microsoft Wi-Fi Direct Virtual Adapter"
+# 同时命中 wi-fi direct 和 virtual，操作员该看到的是前者。
+_NIC_REJECTIONS: tuple[tuple[str, str], ...] = (
+    ("wan miniport", "Windows 拨号虚拟网卡"),
+    ("wi-fi direct", "Wi-Fi Direct 虚拟网卡"),
+    ("loopback", "回环抓包适配器"),
+    ("bluetooth", "蓝牙个人网卡"),
+    ("zerotier", "ZeroTier 虚拟网卡"),
+    ("radmin", "Radmin VPN 虚拟网卡"),
+    ("tap-win32", "TAP 虚拟网卡"),
+    ("tap-windows", "TAP 虚拟网卡"),
+    ("netease", "网易 UU 虚拟网卡"),
+    ("hyper-v", "Hyper-V 虚拟交换机"),
+    ("vmware", "VMware 虚拟网卡"),
+    ("virtualbox", "VirtualBox 虚拟网卡"),
+    ("virtual", "虚拟网卡"),
+    ("802.11", "无线网卡，不能用于 EtherCAT"),
+    ("wi-fi", "无线网卡，不能用于 EtherCAT"),
+    ("wifi", "无线网卡，不能用于 EtherCAT"),
+    ("wireless", "无线网卡，不能用于 EtherCAT"),
+    ("wlan", "无线网卡，不能用于 EtherCAT"),
+)
+
+
+def list_serial_ports(list_ports=None) -> list[SerialCandidate]:
+    """枚举串口。惰性导入 pyserial，smoke/simulate 不会碰到串口机制。"""
+    if list_ports is None:
+        from serial.tools import list_ports as module
+        list_ports = module.comports
+    return [_serial_candidate(port) for port in list_ports()]
+
+
+def _serial_candidate(port) -> SerialCandidate:
+    hwid = getattr(port, "hwid", "") or ""
+    upper = hwid.upper()
+    is_usb = upper.startswith("USB") or "VID:PID" in upper
+    return SerialCandidate(
+        device=getattr(port, "device", "") or "",
+        description=getattr(port, "description", "") or "",
+        hwid=hwid,
+        is_usb=is_usb,
+        reject_reason=None if is_usb else "不是 USB 串口（蓝牙或虚拟端口）",
+    )
+
+
+def rank_serial_ports(ports) -> list[SerialCandidate]:
+    """USB 串口在前，同组内按 COM 号排序。返回全表，不过滤。"""
+    return sorted(ports, key=lambda port: (not port.is_usb, _com_index(port.device),
+                                           port.device))
+
+
+def _com_index(device: str) -> int:
+    match = re.fullmatch(r"COM(\d+)", device.upper())
+    return int(match.group(1)) if match else 10 ** 6
+
+
+def list_nics(find_adapters=None) -> list[NicCandidate]:
+    """枚举抓包适配器。失败一律转成带 Npcap 提示的 RuntimeError。"""
+    try:
+        if find_adapters is None:
+            import pysoem
+            find_adapters = pysoem.find_adapters
+        adapters = list(find_adapters())
+    except Exception as exc:
+        raise RuntimeError(f"枚举网卡失败：{exc}；请确认已安装 Npcap 和 pysoem") from exc
+    candidates = []
+    for index, adapter in enumerate(adapters):
+        description = _decode_desc(getattr(adapter, "desc", ""))
+        candidates.append(NicCandidate(index, description, str(getattr(adapter, "name", "")),
+                                       nic_reject_reason(description)))
+    return candidates
+
+
+def _decode_desc(raw) -> str:
+    """pysoem 的 desc 是 bytes（本机实测），可能含 ® 之类非 ASCII。"""
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")
+    return str(raw)
+
+
+def nic_reject_reason(description: str) -> str | None:
+    """不适合 EtherCAT 的网卡给出中文原因；返回 None 表示是候选。"""
+    lowered = description.lower()
+    for pattern, reason in _NIC_REJECTIONS:
+        if pattern in lowered:
+            return reason
+    return None
+
+
+def rank_nics(nics) -> list[NicCandidate]:
+    """候选网卡在前，其余按枚举顺序跟随。返回全表，不过滤。"""
+    return sorted(nics, key=lambda nic: (nic.reject_reason is not None, nic.index))
+
+
+def resolve_adapter(description: str, *, find_adapters=None) -> str:
+    """人类可读网卡描述 → 当前 pysoem 设备名。
+
+    已经是 ``\\Device\\NPF_...`` 的值原样返回，ENVIRONMENT.md 里的手工流程继续可用。
+    这里只做解析、不做过滤：菜单的过滤只是提示，USB 网卡转 EtherCAT 会被误过滤，
+    所以被过滤的描述仍然必须能解析出来。
+    """
+    if not description:
+        raise ValueError("EtherCAT adapter must be selected explicitly")
+    if description.startswith("\\Device\\NPF_"):
+        return description
+    nics = list_nics(find_adapters)
+    matches = [nic for nic in nics if nic.description == description]
+    if not matches:
+        folded = description.strip().lower()
+        matches = [nic for nic in nics if nic.description.strip().lower() == folded]
+    if not matches:
+        matches = [nic for nic in nics if description.strip().lower() in nic.description.lower()]
+    if not matches:
+        raise ValueError(f"找不到网卡“{description}”；网卡可能已更换或改名，请重新运行向导")
+    if len({nic.name for nic in matches}) > 1:
+        listing = "、".join(sorted(nic.description for nic in matches))
+        raise ValueError(f"网卡描述“{description}”不唯一（{listing}）；"
+                         f"请在 config.local.toml 的 [servo] adapter 里改填 pysoem 设备名")
+    return matches[0].name

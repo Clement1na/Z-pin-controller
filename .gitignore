@@ -11,6 +11,10 @@ build/
 dist/
 *.spec
 
+# ---------- 本机配置与运行记录（向导生成，含串口/网卡，不可提交）----------
+master/config.local.toml
+master/runs/
+
 # ---------- 编辑器 / 系统 ----------
 .vscode/
 .idea/
