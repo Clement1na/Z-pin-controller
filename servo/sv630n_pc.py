@@ -215,7 +215,7 @@ class Sv630n:
             with self.lock:
                 enable, reset, move, target, vel = (self.enable, self.reset_fault,
                                                     self.move_req, self.target, self.vel)
-                if move:
+                if move and enable and (sw & 0x006F) == 0x0027:
                     self.move_req = False
                 self.reset_fault = False
 
@@ -239,7 +239,7 @@ class Sv630n:
                 elif st == 0x23:                  # Switched on
                     cw = 0x000F if enable else 0x0006
                 elif st == 0x27:                  # Operation enabled（CiA402: sw&0x6F==0x27）
-                    if move:
+                    if move and enable:
                         struct.pack_into('<i', out, self.off_tp, target)
                         cw = 0x001F               # 0x0F + bit4 New Setpoint（bit6=0 绝对定位）
                         self.trig_pending = True

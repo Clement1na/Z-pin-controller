@@ -6,7 +6,7 @@
 # 网卡名，留空 = 自动选 Intel 有线网卡
 adapter = ""
 # ★ 辰凌变距模组的丝杆导程(mm)，查模组铭牌，用于 mm<->count 换算
-lead_mm = 1.0
+lead_mm = 13.3333333
 # 18bit 编码器，每圈 count（固定，不改）
 counts_per_rev = 262144
 # 默认速度 mm/s

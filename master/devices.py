@@ -11,10 +11,11 @@ import re
 import sys
 import threading
 import time
+import math
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
+if str(ROOT / "servo") not in sys.path:
     sys.path.insert(0, str(ROOT / "servo"))            # 让 sv630n_pc 可导入
 sys.path.insert(0, str(ROOT / "cnc3d" / "src"))        # 让 cnc_grbl 可导入
 
@@ -22,12 +23,17 @@ sys.path.insert(0, str(ROOT / "cnc3d" / "src"))        # 让 cnc_grbl 可导入
 class ServoAxis:
     """变距模组。mm 接口，内部换算 count（18bit 编码器 262144/圈）。"""
 
-    def __init__(self, adapter: str = "", lead_mm: float = 1.0,
-                 counts_per_rev: int = 262144, vel_mm_s: float = 1.0):
+    def __init__(self, adapter: str = "", lead_mm: float = 13.3333333,
+                 counts_per_rev: int = 262144, vel_mm_s: float = 1.0,
+                 max_expansion_mm: float = 10.0, timeout_s: float = 5.0,
+                 device_factory=None):
         self.adapter = adapter
         self.lead_mm = lead_mm
         self.cpr = counts_per_rev
         self.vel_mm_s = vel_mm_s
+        self.max_expansion_mm = max_expansion_mm
+        self.timeout_s = timeout_s
+        self.device_factory = device_factory
         self.dev = None
 
     @property
@@ -35,12 +41,42 @@ class ServoAxis:
         return self.dev is not None
 
     def connect(self) -> None:
-        from sv630n_pc import Sv630n, pick_adapter  # 惰性导入，pysoem 缺失不影响其它设备
-        ifname = self.adapter or pick_adapter()
-        self.dev = Sv630n(ifname)
-        self.dev.open()
-        self.dev.running = True
-        threading.Thread(target=self.dev.cyclic, daemon=True).start()
+        if self.connected:
+            return
+        if not self.adapter:
+            raise ValueError("EtherCAT adapter must be selected explicitly")
+        if self.device_factory is None:
+            from sv630n_pc import LEAD_MM, Sv630n
+            if not math.isclose(self.lead_mm, LEAD_MM, rel_tol=1e-6):
+                raise ValueError("servo lead_mm differs from calibrated LEAD_MM")
+            factory = Sv630n
+        else:
+            factory = self.device_factory
+        dev = factory(self.adapter)
+        try:
+            dev.open()
+            dev.running = True
+            threading.Thread(target=dev.cyclic, daemon=True).start()
+            with dev.lock:
+                dev.enable = True
+            self._wait_ready(dev)
+        except Exception:
+            dev.close()
+            raise
+        self.dev = dev
+
+    def _wait_ready(self, dev) -> None:
+        deadline = time.monotonic() + self.timeout_s
+        while time.monotonic() < deadline:
+            status = dev.status
+            if status["sw"] & 0x0008:
+                raise RuntimeError("servo fault before motion")
+            if status["wkc_ok"] and status["sw"] & 0x006F == 0x0027:
+                return
+            time.sleep(0.01)
+        if not dev.status["wkc_ok"]:
+            raise TimeoutError("EtherCAT working counter did not become valid")
+        raise TimeoutError("servo did not reach operation enabled state")
 
     def close(self) -> None:
         if self.dev is not None:
@@ -63,18 +99,32 @@ class ServoAxis:
         """绝对定位（变距）。"""
         if not self.connected:
             raise RuntimeError("伺服未连接")
+        if not math.isfinite(mm) or not -self.max_expansion_mm <= mm <= 0:
+            raise ValueError(f"servo target outside calibrated range [-{self.max_expansion_mm}, 0] mm")
+        velocity = self.vel_mm_s if vel_mm_s is None else vel_mm_s
+        if not math.isfinite(velocity) or velocity <= 0:
+            raise ValueError("servo velocity must be finite and positive")
+        self._wait_ready(self.dev)
+        target = self._mm2count(mm)
         with self.dev.lock:
-            self.dev.vel = self._mm2count(vel_mm_s or self.vel_mm_s)
-        self.dev.cmd_move(self._mm2count(mm))
+            self.dev.vel = self._mm2count(velocity)
+        self.dev.cmd_move(target)
+        deadline = time.monotonic() + self.timeout_s
+        tolerance = max(1, self._mm2count(0.05))
+        while time.monotonic() < deadline:
+            status = self.dev.status
+            if status["sw"] & 0x0008:
+                raise RuntimeError("servo fault during move")
+            if not status["wkc_ok"]:
+                raise RuntimeError("EtherCAT working counter lost during move")
+            if status["sw"] & 0x0400 and abs(status["apos"] - target) <= tolerance:
+                return
+            time.sleep(0.01)
+        raise TimeoutError("servo did not reach requested position")
 
     def jog_mm(self, mm: float, vel_mm_s: float | None = None) -> None:
         """相对移动（变距）。"""
-        if not self.connected:
-            raise RuntimeError("伺服未连接")
-        with self.dev.lock:
-            self.dev.vel = self._mm2count(vel_mm_s or self.vel_mm_s)
-            self.dev.target = self.dev.status["apos"] + self._mm2count(mm)
-            self.dev.move_req = True
+        self.move_mm(self.position_mm + mm, vel_mm_s)
 
     @property
     def fault(self) -> bool:
