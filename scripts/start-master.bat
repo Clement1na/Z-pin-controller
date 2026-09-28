@@ -15,11 +15,15 @@ if errorlevel 1 (
 echo [Python] %ZPIN_PY%
 echo.
 
-if "%~1"=="" (
-    "%ZPIN_PY%" "%~dp0..\master\master.py" --smoke-test
-) else (
-    "%ZPIN_PY%" "%~dp0..\master\master.py" %*
-)
+rem No arguments -> master.py shows its mode menu. Do NOT default to
+rem --smoke-test here any more: that would skip the menu, and a double-click
+rem is exactly when the operator wants to choose. master.py decides for
+rem itself whether stdin is a terminal; if it is not, it prints a usage
+rem error instead of waiting for input.
+rem Pass arguments to skip the menu, e.g.:
+rem     start-master.bat --smoke-test
+rem     start-master.bat --live --debug
+"%ZPIN_PY%" "%~dp0..\master\master.py" %*
 
 echo.
 echo Exited.

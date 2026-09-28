@@ -22,11 +22,14 @@ class GrblController:
         baudrate: int = 115200,
         timeout: float = 10.0,
         serial_port: Any | None = None,
+        trace: Any | None = None,
     ) -> None:
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
         self.welcome: str | None = None
+        # 鸭子类型的收发记录钩子（.tx(text) / .rx(Response)）；None = 不记。
+        self._trace = trace
         self._injected_serial = serial_port
         self._serial: Any | None = None
         self._incoming: queue.Queue[Response] = queue.Queue()
@@ -74,6 +77,7 @@ class GrblController:
         if prepared is None:
             return []
         self._require_serial()
+        self._trace_tx(prepared)
         self._write(f"{prepared}\n".encode("ascii", errors="strict"))
         return self._wait_ok(timeout if timeout is not None else self.timeout)
 
@@ -90,19 +94,24 @@ class GrblController:
     def reset(self) -> str:
         self._require_serial()
         self._drain()
+        self._trace_tx("^X")
         self._write_realtime(SOFT_RESET)
         welcome = self._wait_for(ResponseKind.WELCOME, self.timeout, "reset welcome")
         self.welcome = welcome.raw
         return welcome.raw
 
     def hold(self) -> None:
+        self._trace_tx("!")
         self._write_realtime(b"!")
 
     def resume(self) -> None:
+        self._trace_tx("~")
         self._write_realtime(b"~")
 
     def status(self, timeout: float = 2.0) -> Response:
         self._require_serial()
+        # '?' 不回显：它是每秒 10 次的轮询，不是操作员主动发的命令。它的回话
+        # 由 GrblTrace 折叠成状态变化。
         self._write_realtime(b"?")
         report = self._wait_for(ResponseKind.STATUS, timeout, "status")
         self._last_status = report
@@ -146,6 +155,14 @@ class GrblController:
     def _write_realtime(self, data: bytes) -> None:
         self._write(data)
 
+    def _trace_tx(self, text: str) -> None:
+        if self._trace is not None:
+            self._trace.tx(text)
+
+    def _trace_rx(self, response: Response) -> None:
+        if self._trace is not None:
+            self._trace.rx(response)
+
     def _reader_loop(self) -> None:
         while self._running:
             serial_port = self._serial
@@ -165,6 +182,7 @@ class GrblController:
             response = parse_response(text)
             if response.kind == ResponseKind.STATUS:
                 self._last_status = response
+            self._trace_rx(response)
             self._incoming.put(response)
 
     def _drain(self) -> None:

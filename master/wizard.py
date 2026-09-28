@@ -29,9 +29,11 @@ class WizardCancelled(Exception):
 
 
 class Wizard:
-    def __init__(self, *, input_fn=input, output=None,
+    def __init__(self, *, input_fn=None, output=None,
                  cancel_words=("Q", "QUIT", "取消")):
-        self._input = input_fn
+        # input_fn 留空时在构造这一刻才取内建 input，而不是在 def 那一刻绑定：
+        # 测试用 patch("builtins.input") 换掉的正是这个内建。
+        self._input = input if input_fn is None else input_fn
         self.output = sys.stdout if output is None else output
         self._cancel_words = cancel_words
 
@@ -90,6 +92,22 @@ class Wizard:
             raise ValueError(f"请输入 y 或 n，收到 {raw!r}")
 
         return self._ask_validated(prompt, parse, default="Y" if default else "N")
+
+    def choose(self, prompt: str, options, *, default: str | None = None) -> str:
+        """把选项渲染成编号菜单，返回所选项的 key。
+
+        options 形如 (("1", "实机运行"), ("0", "退出"))——编号由调用方显式给出，
+        于是"退出"可以是 [0]，不必排到最后变成 [5]。key 原样返回，调用方按字符串比。
+        """
+        keys = [key for key, _ in options]
+        for key, label in options:
+            self.say(f"  [{key}] {label}")
+        for _ in range(20):
+            raw = self.ask(prompt, default=default)
+            if raw in keys:
+                return raw
+            self.warn(f"无效编号：{raw}（可用 {'/'.join(keys)}）")
+        raise WizardCancelled("连续 20 次输入无效，已中止")
 
 
 # ------------------------------------------------------------------ 串口
@@ -336,8 +354,8 @@ def confirm_assertions(w: Wizard) -> None:
 
 # ------------------------------------------------------------------ 编排
 def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapters=None,
-                     list_ports=None, results_dir=None, input_fn=input,
-                     output=None) -> int:
+                     list_ports=None, results_dir=None, input_fn=None,
+                     output=None, debug=False) -> int:
     """交互式实机流程：环境 → 作业 → 连接 → 零点 → 对刀 → 确认 → 运行。"""
     from master import master as cli
     from master.local_config import load_merged, local_path_for, write_local
@@ -362,7 +380,8 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
 
         _apply(cfg, env)
         cfg.setdefault("head", {}).update(_head_window(motion))
-        devices = cli._open_live_devices(cfg, geometry, motion)
+        echo = cli._make_echo(debug)
+        devices = cli._open_live_devices(cfg, geometry, motion, echo=echo)
         cli._connect_live_devices(devices)
         w.say(f"连接后状态：CNC WPos={devices.cnc.position()}，"
               f"滑台软件读数={devices.head.position_mm():.3f} mm。")
@@ -385,7 +404,8 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
             w.warn("操作员未放行，未开始自动植入。")
             return 1
         return cli._execute_live_job(cfg2, job2, motion2, scan_z2, plan2, devices,
-                                     results_dir=_results_dir(config_path, results_dir))
+                                     results_dir=_results_dir(config_path, results_dir),
+                                     echo=echo)
     except WizardCancelled as exc:
         w.warn(f"已取消（{exc}），未开始自动植入。")
         return 1

@@ -27,7 +27,7 @@ class ServoAxis:
     def __init__(self, adapter: str = "", lead_mm: float = 13.3333333,
                  counts_per_rev: int = 262144, vel_mm_s: float = 1.0,
                  max_expansion_mm: float = 10.0, timeout_s: float = 5.0,
-                 device_factory=None):
+                 device_factory=None, echo=None):
         self.adapter = adapter
         self.lead_mm = lead_mm
         self.cpr = counts_per_rev
@@ -35,10 +35,20 @@ class ServoAxis:
         self.max_expansion_mm = max_expansion_mm
         self.timeout_s = timeout_s
         self.device_factory = device_factory
+        self.echo = echo
         self.cancel_event = None
         self.origin_count = None
         self.boot_count = None
         self.dev = None
+
+    # 驱动器没有行协议，"回话"就是状态字。echo=None 时全部静默。
+    def _say_tx(self, text: str) -> None:
+        if self.echo is not None:
+            self.echo.tx("伺服", text)
+
+    def _say_rx(self, text: str) -> None:
+        if self.echo is not None:
+            self.echo.rx("伺服", text)
 
     @property
     def connected(self) -> bool:
@@ -72,17 +82,25 @@ class ServoAxis:
         self.dev = dev
         self.origin_count = None
         self.boot_count = dev.status["apos"]
+        status = dev.status
+        self._say_rx(f"链路就绪 状态字=0x{status['sw']:04X} "
+                     f"位置={self._count2mm(status['apos']):+.3f} mm")
 
     def _wait_link(self, dev) -> None:
+        """等链路进入稳态。驱动器刚进 OP 时会瞬时置故障位（本机实测约 5 ms，故障码 0x603F = 0）
+        然后自行清除；每 10 ms 轮询一次去抓那 5 ms 是纯竞态，所以这里等的是"健康稳态"，
+        只有故障位一直不清才判死。动之前的 _wait_ready 仍然严格，不动。"""
         deadline = time.monotonic() + self.timeout_s
         while time.monotonic() < deadline:
             status = dev.status
-            if status["sw"] & 0x0008:
-                raise RuntimeError("servo fault on connect")
-            if status["wkc_ok"]:
+            if status["wkc_ok"] and not status["sw"] & 0x0008:
                 return
             time.sleep(0.01)
-        raise TimeoutError("EtherCAT working counter did not become valid")
+        if not dev.status["wkc_ok"]:
+            self._say_rx("链路故障：工作计数器始终无效")
+            raise TimeoutError("EtherCAT working counter did not become valid")
+        self._say_rx(f"链路故障 状态字=0x{dev.status['sw']:04X}")
+        raise RuntimeError(f"servo fault on connect: 状态字=0x{dev.status['sw']:04X}")
 
     def _wait_ready(self, dev) -> None:
         deadline = time.monotonic() + self.timeout_s
@@ -91,7 +109,8 @@ class ServoAxis:
                 raise RuntimeError("servo wait cancelled")
             status = dev.status
             if status["sw"] & 0x0008:
-                raise RuntimeError("servo fault before motion")
+                self._say_rx(f"故障 状态字=0x{status['sw']:04X}")
+                raise RuntimeError(f"servo fault before motion: 状态字=0x{status['sw']:04X}")
             if status["wkc_ok"] and status["sw"] & 0x006F == 0x0027:
                 return
             time.sleep(0.01)
@@ -137,6 +156,7 @@ class ServoAxis:
             raise RuntimeError("servo is not connected")
         if not self.dev.enable:
             raise RuntimeError("servo must be explicitly enabled before setting zero")
+        self._say_tx("记录当前点为本次连接的伺服逻辑零位")
         self._wait_ready(self.dev)
         self.origin_count = self.dev.status["apos"]
 
@@ -153,6 +173,7 @@ class ServoAxis:
         target = self.dev.status["apos"] + self._mm2count(delta_mm)
         if abs(self._count2mm(target - self.boot_count)) > self.max_expansion_mm + 1e-6:
             raise ValueError("manual servo jog exceeds boot-relative 10 mm guard")
+        self._say_tx(f"点动 {delta_mm:+.3f} mm")
         self._move_raw(target, self.vel_mm_s)
 
     def move_mm(self, mm: float, vel_mm_s: float | None = None) -> None:
@@ -167,6 +188,7 @@ class ServoAxis:
         if self.origin_count is None:
             raise RuntimeError("servo logical zero has not been set")
         target = self.origin_count + self._mm2count(mm)
+        self._say_tx(f"绝对定位 {mm:+.3f} mm")
         self._move_raw(target, velocity)
 
     def _move_raw(self, target: int, velocity: float) -> None:
@@ -183,10 +205,13 @@ class ServoAxis:
                 raise RuntimeError("servo move cancelled")
             status = self.dev.status
             if status["sw"] & 0x0008:
-                raise RuntimeError("servo fault during move")
+                self._say_rx(f"故障 状态字=0x{status['sw']:04X}")
+                raise RuntimeError(f"servo fault during move: 状态字=0x{status['sw']:04X}")
             if not status["wkc_ok"]:
+                self._say_rx("工作计数器在运动中丢失")
                 raise RuntimeError("EtherCAT working counter lost during move")
             if status["sw"] & 0x0400 and abs(status["apos"] - target) <= tolerance:
+                self._say_rx(f"状态字=0x{status['sw']:04X} 到位")
                 return
             time.sleep(0.01)
         raise TimeoutError("servo did not reach requested position")
@@ -206,11 +231,13 @@ class ServoAxis:
     def disable(self) -> None:
         self.origin_count = None
         if self.dev is not None:
+            self._say_tx("释放（清空逻辑零位）")
             self.dev.set_enabled(False)
 
     def enable(self) -> None:
         if not self.connected:
             raise RuntimeError("servo is not connected")
+        self._say_tx("使能")
         self.dev.set_enabled(True)
         try:
             self._wait_ready(self.dev)
@@ -224,12 +251,13 @@ class Cnc3D:
 
     def __init__(self, port: str = "COM9", baud: int = 115200,
                  feed: int = 1500, limits=(100.0, 100.0, 50.0),
-                 controller_factory=None):
+                 controller_factory=None, echo=None):
         self.port = port
         self.baud = baud
         self.feed = feed
         self.limits = limits
         self.controller_factory = controller_factory
+        self.echo = echo
         self.cancel_event = None
         self.cnc = None
 
@@ -240,12 +268,17 @@ class Cnc3D:
     def connect(self) -> None:
         from cnc_grbl import GrblController  # 惰性导入
         factory = self.controller_factory or GrblController
-        cnc = factory(port=self.port, baudrate=self.baud)
+        options = {}
+        if self.echo is not None:
+            from master.echo import GrblTrace  # 惰性导入，--smoke-test 不加载回显层
+            options["trace"] = GrblTrace(self.echo, "CNC")
+        cnc = factory(port=self.port, baudrate=self.baud, **options)
         try:
             cnc.connect()
             rep = cnc.status()
             if (rep.state or "").lower().startswith("alarm"):
-                raise RuntimeError("CNC Alarm: operator must inspect and unlock manually")
+                raise RuntimeError(
+                    f"CNC Alarm: operator must inspect and unlock manually ({rep.raw})")
             cnc.send("G21")
             cnc.send("G90")
         except Exception:
@@ -276,7 +309,7 @@ class Cnc3D:
             rep = self.cnc.status()
             state = (rep.state or "").lower()
             if state.startswith("alarm"):
-                raise RuntimeError("CNC entered Alarm during move")
+                raise RuntimeError(f"CNC entered Alarm during move: {rep.raw}")
             if state == "idle":
                 position = self.position()
                 if position is not None and all(abs(actual - target) <= 0.05
@@ -319,13 +352,15 @@ class InsertHead:
     """植入滑台 + 双气阀。协议（firmware/insert_head/insert_head.ino）：数字=绝对mm、z/e/d/a1/a0/b1/b0/q/s"""
 
     def __init__(self, port: str = "COM7", baud: int = 115200, travel_mm: float = 50.0,
-                 motion=None, serial_factory=None, startup_delay_s: float = 0.8):
+                 motion=None, serial_factory=None, startup_delay_s: float = 0.8,
+                 echo=None):
         self.port = port
         self.baud = baud
         self.travel = travel_mm
         self.motion = motion
         self.serial_factory = serial_factory
         self.startup_delay_s = startup_delay_s
+        self.echo = echo
         self._stopped = False
         self.zero_confirmed = False
         self.ser = None
@@ -362,6 +397,8 @@ class InsertHead:
     def _send(self, line: str) -> None:
         if not self.connected:
             raise RuntimeError("滑台未连接")
+        if self.echo is not None:
+            self.echo.tx("GX28", line)
         self.ser.write((line + "\n").encode("ascii"))
 
     def _read_until(self, keywords: tuple[str, ...], timeout: float) -> list[str]:
@@ -374,9 +411,12 @@ class InsertHead:
             line = raw.decode("utf-8", errors="replace").strip()
             if line:
                 got.append(line)
+                if self.echo is not None:
+                    # 固件原话先落地，主控的转述随后——出错时也得看得见设备说了什么。
+                    self.echo.rx("GX28", line)
                 if "已紧急停止" in line:
                     self._stopped = True
-                    raise RuntimeError("head stopped; position is untrusted")
+                    raise RuntimeError(f"head stopped; position is untrusted: {line}")
                 if line.startswith(("错误:", "ERROR:")):
                     raise RuntimeError(f"head firmware error: {line}")
                 if any(k in line for k in keywords):

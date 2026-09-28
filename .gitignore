@@ -7,9 +7,12 @@ venv/
 env/
 
 # ---------- 打包产物（PyInstaller，见 ENVIRONMENT.md 的"打包"一节）----------
+# build/ 和 dist/ 是产物，*.spec 是 PyInstaller 的默认产物名；
+# 但 packaging/ZpinControl.spec 是**构建输入**，必须入库，所以下面开了白名单。
 build/
 dist/
 *.spec
+!packaging/ZpinControl.spec
 
 # ---------- 本机配置与运行记录（向导生成，含串口/网卡，不可提交）----------
 master/config.local.toml

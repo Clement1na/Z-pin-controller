@@ -112,53 +112,103 @@ def _read_live_configuration(path: Path, confirmed: bool,
     return cfg, job, geometry, motion, scan_z, plan
 
 
-def _read_stop_commands(commands: queue.Queue[str]) -> None:
+def _read_stop_commands(commands: queue.Queue[str], *, echo=None) -> None:
+    prompt = "运行中，输入 ! 急停 > "
     while True:
         try:
-            commands.put(input("运行中，输入 ! 急停 > ").strip())
+            if echo is not None:
+                # 回显行会 \r 擦掉提示行，所以擦之前先让它知道提示语是什么。
+                echo.hold_prompt(prompt)
+            commands.put(input(prompt).strip())
         except EOFError:
             commands.put("EOF")
             return
+        finally:
+            if echo is not None:
+                echo.release_prompt()
 
 
-def _prepare_live_zeros(servo, head) -> bool:
-    print("警告：断电重启后，滑台和伺服都会把当前点当作软件零位；它不代表机械零位。")
-    print("先确认滑台处于安全待机位置；伺服应调整到靠紧的 2 mm 工位间距位置。")
-    print("伺服设置命令：ENABLE 使能；JOG ±毫米 小步点动（每次最多 0.5 mm）；"
-          "SERVO-ZERO 设当前点为伺服零位；HEAD-ZERO 确认滑台待机并发送 z；RUN 开始；QUIT 退出。")
-    print("已知方向：负距离张开、正距离靠紧；点动时须观察实际机构。")
-    print(f"伺服相对本次连接初始读数：{servo.setup_offset_mm:+.3f} mm（不是机械基准）。")
+# 点动单步上限。机构余量很小，人眼也跟不上更大的步长。
+JOG_LIMIT_MM = 0.5
+
+SAFETY_MENU = (
+    ("1", "使能伺服"),
+    ("2", "点动伺服（小步，每次最多 0.5 mm）"),
+    ("3", "伺服设零（把当前点记为本次连接的伺服零位）"),
+    ("4", "滑台设零（确认待机位并发送 z）"),
+    ("5", "开始植入"),
+    ("0", "退出（不开始）"),
+)
+
+JOG_DIRECTIONS = (
+    ("1", "靠紧（正，工位间距变小）"),
+    ("2", "张开（负，工位间距变大）"),
+    ("0", "返回"),
+)
+
+
+def _ask_jog(menu) -> float | None:
+    """点动方向做成选项：负距离张开、正距离靠紧，符号本身反直觉，问方向比记符号可靠。"""
+    choice = menu.choose("点动方向", JOG_DIRECTIONS)
+    if choice == "0":
+        return None
+    distance = menu.ask_float("点动距离 mm", minimum=0.0, maximum=JOG_LIMIT_MM)
+    return (1.0 if choice == "1" else -1.0) * distance
+
+
+def _prepare_live_zeros(servo, head, *, menu=None) -> bool:
+    """安全设置菜单。返回 True 表示可以开始自动植入。
+
+    动硬件之前必须由操作员逐项确认：先使能、再小步点动看机构、然后把当前点记为
+    零点。零点不满足就拒绝启动并说明缺哪一项——这一步不是走过场，断电重启后
+    伺服逻辑零点必然被清空，正常一次开机都要走这里。
+    """
+    if menu is None:
+        from master.menu import make_menu
+        menu = make_menu()
+    from master.wizard import WizardCancelled
+
+    menu.say("警告：断电重启后，滑台和伺服都会把当前点当作软件零位；它不代表机械零位。")
+    menu.say("先确认滑台处于安全待机位置；伺服应调整到靠紧的 2 mm 工位间距位置。")
+    menu.say("已知方向：负距离张开、正距离靠紧；点动时须观察实际机构。")
+    menu.say(f"伺服相对本次连接初始读数：{servo.setup_offset_mm:+.3f} mm（不是机械基准）。")
     while True:
+        menu.say("--- 安全设置 ---")
         try:
-            command = input("安全设置 > ").strip().upper()
-        except (EOFError, KeyboardInterrupt):
-            return False
-        try:
-            if command == "ENABLE":
+            choice = menu.choose("操作", SAFETY_MENU)
+            if choice == "1":
                 servo.enable()
-                print("伺服已使能；请观察机构后再点动。")
-            elif command.startswith("JOG "):
-                delta = float(command.split(maxsplit=1)[1])
+                menu.say("伺服已使能；请观察机构后再点动。")
+            elif choice == "2":
+                delta = _ask_jog(menu)
+                if delta is None:
+                    continue
                 servo.jog_setup_mm(delta)
-                print(f"伺服已点动 {delta:+g} mm；相对连接初始读数 "
-                      f"{servo.setup_offset_mm:+.3f} mm。请检查实际位置。")
-            elif command == "SERVO-ZERO":
+                menu.say(f"伺服已点动 {delta:+g} mm；相对连接初始读数 "
+                         f"{servo.setup_offset_mm:+.3f} mm。请检查实际位置。")
+            elif choice == "3":
                 servo.set_zero()
-                print("伺服逻辑零位已记录为当前机械位置。")
-            elif command == "HEAD-ZERO":
+                menu.say("伺服逻辑零位已记录为当前机械位置。")
+            elif choice == "4":
                 head.zero()
-                print("滑台当前待机位置已设为软件 0 mm。")
-            elif command == "RUN":
-                if servo.origin_count is None or not head.zero_confirmed:
-                    print("禁止启动：请先完成 SERVO-ZERO 和 HEAD-ZERO。")
+                menu.say("滑台当前待机位置已设为软件 0 mm。")
+            elif choice == "5":
+                # 只列**还缺**的项。固定文案会把已经做完的那项也报出来，
+                # 操作员照着提示重做一遍是小事，怀疑自己做错了才是大事。
+                missing = [label for label, done in
+                           (("[3] 伺服设零", servo.origin_count is not None),
+                            ("[4] 滑台设零", head.zero_confirmed))
+                           if not done]
+                if missing:
+                    menu.warn("禁止启动：还缺 " + " 和 ".join(missing) + "。")
                     continue
                 return True
-            elif command in ("QUIT", "Q", "!"):
-                return False
             else:
-                print("无效命令；可用 ENABLE、JOG ±毫米、SERVO-ZERO、HEAD-ZERO、RUN、QUIT。")
+                return False
+        except WizardCancelled:
+            return False
         except (ValueError, RuntimeError, TimeoutError) as exc:
-            print(f"设置失败：{exc}")
+            menu.warn(f"设置失败：{exc}")
 
 
 @dataclass
@@ -168,18 +218,31 @@ class LiveDevices:
     head: object
 
 
-def _open_live_devices(cfg: dict, geometry: MachineGeometry, motion: HeadMotion) -> LiveDevices:
+def _make_echo(debug: bool):
+    """调试输出关闭时返回 None —— 设备层的约定是 None = 全静默。
+
+    只有给了 --debug（或启动菜单里打开）才会有回显对象，其余路径一个字节都不多打。
+    """
+    if not debug:
+        return None
+    from master.echo import DeviceEcho
+    return DeviceEcho()
+
+
+def _open_live_devices(cfg: dict, geometry: MachineGeometry, motion: HeadMotion, *,
+                       echo=None) -> LiveDevices:
     """只构造对象，不碰硬件。连接失败前不会有任何动作。"""
     from master.devices import Cnc3D, InsertHead, ServoAxis
 
     sv, cn, hd = cfg["servo"], cfg["cnc3d"], cfg["head"]
     return LiveDevices(
         servo=ServoAxis(adapter=sv["adapter"], lead_mm=geometry.servo_lead_mm,
-                        counts_per_rev=sv["counts_per_rev"], vel_mm_s=sv["vel_mm_s"]),
+                        counts_per_rev=sv["counts_per_rev"], vel_mm_s=sv["vel_mm_s"],
+                        echo=echo),
         cnc=Cnc3D(port=cn["port"], baud=cn["baud"], feed=cn["feed"],
-                  limits=(cn["x_max"], cn["y_max"], cn["z_max"])),
+                  limits=(cn["x_max"], cn["y_max"], cn["z_max"]), echo=echo),
         head=InsertHead(port=hd["port"], baud=hd["baud"],
-                        travel_mm=hd["travel_mm"], motion=motion))
+                        travel_mm=hd["travel_mm"], motion=motion, echo=echo))
 
 
 def _connect_live_devices(devices: LiveDevices) -> None:
@@ -226,7 +289,8 @@ def _make_reporter(job, plan, motion, scan_z, results_dir):
 
 
 def _execute_live_job(cfg: dict, job: JobSpec, motion: HeadMotion, scan_z: float,
-                      plan, devices: LiveDevices, *, results_dir: Path | None = None) -> int:
+                      plan, devices: LiveDevices, *, results_dir: Path | None = None,
+                      echo=None) -> int:
     gate = OperatorGate()
     reporter = _make_reporter(job, plan, motion, scan_z, results_dir)
     coordinator = Coordinator(devices.servo, devices.cnc, devices.head, motion,
@@ -237,7 +301,8 @@ def _execute_live_job(cfg: dict, job: JobSpec, motion: HeadMotion, scan_z: float
     print("实时运行：输入 ! 可请求三路停止。每次五针退回且 B 阀排气后，"
           "请剪丝并按屏幕提示输入 READY 代码，才会移动到下一落点。")
     commands: queue.Queue[str] = queue.Queue()
-    reader = threading.Thread(target=_read_stop_commands, args=(commands,), daemon=True)
+    reader = threading.Thread(target=_read_stop_commands, args=(commands,),
+                              kwargs={"echo": echo}, daemon=True)
     reader.start()
     holder: list = []
 
@@ -277,10 +342,11 @@ def _execute_live_job(cfg: dict, job: JobSpec, motion: HeadMotion, scan_z: float
 
 def run_live(config_path: Path, confirmed: bool,
              job_overrides: dict[str, float] | None = None, *,
-             results_dir: Path | None = None) -> int:
+             results_dir: Path | None = None, debug: bool = False) -> int:
     cfg, job, geometry, motion, scan_z, plan = _read_live_configuration(
         config_path, confirmed, job_overrides)
-    devices = _open_live_devices(cfg, geometry, motion)
+    echo = _make_echo(debug)
+    devices = _open_live_devices(cfg, geometry, motion, echo=echo)
     if results_dir is None:
         results_dir = Path(config_path).parent / "runs"
     try:
@@ -293,14 +359,15 @@ def run_live(config_path: Path, confirmed: bool,
             print("已取消，未开始自动植入。")
             return 1
         return _execute_live_job(cfg, job, motion, scan_z, plan, devices,
-                                 results_dir=results_dir)
+                                 results_dir=results_dir, echo=echo)
     finally:
         _close_live_devices(devices)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Z-pin five-head controller")
-    mode = parser.add_mutually_exclusive_group(required=True)
+    # 三个模式参数保留原样、且仍然互斥；不带任何模式参数时才进菜单。
+    mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--smoke-test", action="store_true", help="run full reference job without hardware")
     mode.add_argument("--simulate", action="store_true", help="run a specified job without hardware")
     mode.add_argument("--live", action="store_true", help="connect to actual machine after preflight")
@@ -314,8 +381,20 @@ def main(argv: list[str] | None = None) -> int:
                         help="confirm manual CNC work zero, safe scan height and head datum")
     parser.add_argument("--results-dir", type=Path,
                         help="directory for the per-placement CSV and JSON summary")
+    parser.add_argument("--debug", action="store_true",
+                        help="回显设备每一行回话；CNC 的 ? 状态轮询折叠为状态变化")
     args = parser.parse_args(argv)
+    # sys.stdin 可能是 None（pythonw、打包成无控制台窗口时），那时 isatty() 会直接抛异常。
+    interactive = sys.stdin is not None and sys.stdin.isatty()
+    if not (args.smoke_test or args.simulate or args.live) and not interactive:
+        # 非交互环境（管道、重定向、自动化）不给菜单，否则会挂在那里等输入。
+        parser.error("需要 --smoke-test / --simulate / --live 之一；"
+                     "在终端里不带参数运行才会进入菜单")
     try:
+        if not (args.smoke_test or args.simulate or args.live):
+            from master.menu import run_startup_menu
+            return run_startup_menu(config_path=args.config,
+                                    results_dir=args.results_dir, debug=args.debug)
         if args.live:
             overrides = {key: value for key, value in
                          (("width_mm", args.width), ("height_mm", args.height),
@@ -326,9 +405,10 @@ def main(argv: list[str] | None = None) -> int:
                 # 否则 run_live(confirmed=False) 的"连接前拒绝"语义会被向导吞掉。
                 from master.wizard import run_setup_wizard
                 return run_setup_wizard(args.config, job_overrides=overrides,
-                                        results_dir=args.results_dir)
+                                        results_dir=args.results_dir, debug=args.debug)
             extra = {} if args.results_dir is None else {"results_dir": args.results_dir}
-            return run_live(args.config, args.confirm_datum, job_overrides=overrides, **extra)
+            return run_live(args.config, args.confirm_datum, job_overrides=overrides,
+                            debug=args.debug, **extra)
         job = JobSpec(args.width if args.width is not None else 360,
                       args.height if args.height is not None else 360,
                       args.spacing if args.spacing is not None else 4,
