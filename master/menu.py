@@ -24,7 +24,8 @@ def make_menu(*, input_fn=None, output=None):
 
 
 def run_startup_menu(*, config_path, results_dir=None, debug=False, menu=None,
-                     wizard_fn=None, simulate_fn=None) -> int:
+                     wizard_fn=None, simulate_fn=None, profile_manager_fn=None,
+                     manual_fn=None) -> int:
     """没有给模式参数、且在终端里直接运行时进入这里。
 
     选定一项就执行并返回它的退出码，**不弹回菜单**：实机跑完机器处于需要人工
@@ -36,11 +37,16 @@ def run_startup_menu(*, config_path, results_dir=None, debug=False, menu=None,
     """
     from master.master import SMOKE_JOB, SMOKE_ROWS, _known_geometry, run_simulation
     from master.model import RowSpec
+    from master.profile_ui import run_profile_manager
+    from master.profiles import ProfileStore
     from master.wizard import WizardCancelled, collect_job, run_setup_wizard
 
     menu = make_menu() if menu is None else menu
     wizard_fn = run_setup_wizard if wizard_fn is None else wizard_fn
     simulate_fn = run_simulation if simulate_fn is None else simulate_fn
+    profile_manager_fn = run_profile_manager if profile_manager_fn is None else profile_manager_fn
+    store = ProfileStore(Path(config_path).parent / "profiles")
+    selection = store.load_selection()
     debug_on = debug
     while True:
         menu.say("")
@@ -53,6 +59,9 @@ def run_startup_menu(*, config_path, results_dir=None, debug=False, menu=None,
                       f"{SMOKE_JOB['length_mm']:g} / 点距 {SMOKE_JOB['spacing_mm']:g} / "
                       f"{SMOKE_ROWS} 排）"),
                 ("4", f"调试输出：{'开' if debug_on else '关'}"),
+                ("5", f"配置档案（机器：{selection['machine'] or '未选择'}；"
+                      f"作业：{selection['job'] or '未选择'}）"),
+                ("6", "组件手动控制"),
                 ("0", "退出"),
             ))
         except WizardCancelled:
@@ -62,10 +71,14 @@ def run_startup_menu(*, config_path, results_dir=None, debug=False, menu=None,
             debug_on = not debug_on
             menu.say(f"调试输出已{'开启' if debug_on else '关闭'}。")
             continue
+        if choice == "5":
+            selection = profile_manager_fn(store, menu, Path(config_path), _known_geometry())
+            continue
         if choice == "0":
             return 0
         if choice == "1":
-            code = wizard_fn(Path(config_path), results_dir=results_dir, debug=debug_on)
+            code = wizard_fn(Path(config_path), results_dir=results_dir, debug=debug_on,
+                             profile_store=store, profile_selection=selection)
         elif choice == "2":
             # 参数问答也必须接住取消。`menu.choose` 上面裹了，这里不裹的话 `Q`/Ctrl-C
             # 会让 WizardCancelled 一路逃出 main 的 except 元组，未捕获异常直接结束进程
@@ -76,8 +89,14 @@ def run_startup_menu(*, config_path, results_dir=None, debug=False, menu=None,
                 menu.say(f"已取消（{exc}），未开始仿真；回到菜单。")
                 continue
             code = simulate_fn(row)
-        else:
+        elif choice == "3":
             code = simulate_fn(RowSpec(**SMOKE_JOB), rows=SMOKE_ROWS)
+        else:
+            if manual_fn is None:
+                menu.warn("组件手动控制尚未接入。")
+                continue
+            code = manual_fn(store=store, selection=selection,
+                             config_path=Path(config_path), debug=debug_on)
         _hold_before_exit(menu)
         return code
 

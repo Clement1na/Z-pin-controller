@@ -394,7 +394,8 @@ def confirm_assertions(w: Wizard) -> None:
 # ------------------------------------------------------------------ 编排
 def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapters=None,
                      list_ports=None, results_dir=None, input_fn=None,
-                     output=None, debug=False) -> int:
+                     output=None, debug=False, profile_store=None,
+                     profile_selection=None) -> int:
     """交互式实机流程：环境 → 作业 → 连接 → 零点 → 对刀 → 确认 → 运行。"""
     from master import master as cli
     from master.local_config import load_merged, local_path_for, write_local
@@ -406,6 +407,11 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
     local_path = local_path_for(config_path)
     geometry = cli._known_geometry()
     cfg = load_merged(config_path)
+    if profile_store is not None and profile_selection:
+        machine = profile_selection.get("machine")
+        job = profile_selection.get("job")
+        if machine and job:
+            cfg = profile_store.compose(config_path, machine=machine, job=job)
     devices = None
     try:
         env = collect_environment(w, cfg, find_adapters=find_adapters,
@@ -432,6 +438,14 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
         confirm_assertions(w)
         write_local(local_path, _local_sections(env, motion, scan_z))
         w.say(f"已写入 {local_path}（含 scan_z_mm={scan_z:g} mm）")
+        if profile_store is not None and profile_selection:
+            machine = profile_selection.get("machine")
+            job = profile_selection.get("job")
+            if machine and job:
+                profile_store.save("machines", machine,
+                                   _local_sections(env, motion, scan_z))
+                profile_store.save("jobs", job, {"job": job_values(row)})
+                w.say(f"已同步保存机器配置 {machine} 和作业方案 {job}。")
 
         # 用写出的文件重新校验一遍：写出器的 bug 必须在这里暴露，而不是在运动中途。
         cfg2, row2, _, motion2, scan_z2, plan2, datum2 = cli._read_live_configuration(
