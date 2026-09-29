@@ -15,7 +15,8 @@ feed = 1500
 x_max = 100.0             # replace with measured safe work-coordinate limit
 y_max = 100.0
 z_max = 50.0
-# scan_z_mm = ...         # manually verified height safe for XY scanning
+# scan_z_mm = ...         # row-change clearance: high enough to turn the tube, and
+                          # it must clear the HIGHEST work height anywhere in the row
 
 [head]
 port = ""                  # GX28 controller USB serial port
@@ -24,7 +25,8 @@ travel_mm = 50.0          # nominal slide travel; NOT the software work window
 firmware_verified = false # set true only after flashing and checking protocol 2 firmware
 datum_confirmed = false  # set true only after measuring the signed useful window
 # standby_mm = 0.0        # physical standby is manually confirmed then set to software zero
-# insertion_mm = -5.0     # example only: tested downward direction is negative
+# insertion_mm is DERIVED, not configured: it is depth/cos(theta), measured
+# perpendicular to the tube wall. A value written here is ignored.
 # work_min_mm = -10.0     # example only: actual safe down limit must be measured
 # work_max_mm = 0.0       # firmware prohibits motion above standby
 
@@ -32,8 +34,9 @@ datum_confirmed = false  # set true only after measuring the signed useful windo
 valve_delay_ms = 500
 upper_release_after_retract = false  # confirm on machine before full job
 
-# [job]                  # defaults; explicit --width/--height/--spacing/--thickness override one run
-# width_mm = 360.0
-# height_mm = 360.0
-# spacing_mm = 4.0
-# plate_thickness_mm = 5.0
+# [job]                  # defaults; explicit --angle/--length/--spacing/--depth override one run.
+                         # One job is one row; the tube is turned by hand and the row repeats.
+# angle_deg = 15.0       # signed: the tube is fixtured, the needles stay vertical
+# length_mm = 20.0       # reinforced span, NOT the stock length
+# spacing_mm = 2.0
+# depth_mm = 2.0         # perpendicular to the tube wall; hard limit 3 mm (metal joint below)

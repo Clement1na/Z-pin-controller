@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import math
 import queue
+import secrets
 import sys
 import threading
 from dataclasses import dataclass
@@ -14,9 +16,9 @@ sys.path.insert(0, str(ROOT))
 
 from master.coordinator import Coordinator, RunState
 from master.local_config import load_merged, local_path_for, write_local
-from master.model import HeadMotion, JobSpec, MachineGeometry
+from master.model import HeadMotion, MachineGeometry, RowSpec
 from master.operator_gate import OperatorGate
-from master.planner import plan_grid
+from master.planner import highest_work_z_mm, plan_row, work_z_mm
 from master.simulated import SimulationRig
 
 
@@ -26,7 +28,13 @@ def default_config_path() -> Path:
     return Path(__file__).resolve().parent / "config.toml"
 
 
-JOB_KEYS = ("width_mm", "height_mm", "spacing_mm", "plate_thickness_mm")
+JOB_KEYS = ("angle_deg", "length_mm", "spacing_mm", "depth_mm")
+
+# --smoke-test 的新基准：0.2% 密度的一排，重复三遍，好让打包验收真的走到排循环。
+SMOKE_JOB = {"angle_deg": 15.0, "length_mm": 20.0, "spacing_mm": 2.0, "depth_mm": 2.0}
+SMOKE_ROWS = 3
+SMOKE_DATUM = (0.0, -5.0)
+SMOKE_SCAN_Z_MM = 0.0
 
 
 def _known_geometry() -> MachineGeometry:
@@ -34,98 +42,163 @@ def _known_geometry() -> MachineGeometry:
                            max_expansion_mm=10, servo_lead_mm=13.3333333)
 
 
-def _print_plan(job: JobSpec, plan) -> None:
-    print(f"Job: width {job.width_mm:g} mm, height {job.height_mm:g} mm, "
-          f"spacing {job.spacing_mm:g} mm, thickness {job.plate_thickness_mm:g} mm")
-    print(f"Plan: {job.point_count} points, {len(plan.placements)} placements, "
-          f"needle pitch {plan.needle_pitch_mm:g} mm, servo {plan.servo_target_mm:g} mm")
+def _print_plan(row: RowSpec, plan, *, datum=None, scan_z_mm: float | None = None) -> None:
+    step = row.needle_length_step_mm(plan.needle_pitch_mm)
+    print(f"作业：架角 {row.angle_deg:+g}°，强化区 {row.length_mm:g} mm，"
+          f"点距 {row.spacing_mm:g} mm，深度 {row.depth_mm:g} mm")
+    print(f"排程：每排 {row.x_count} 个植入点，{len(plan.placements)} 次五针动作，"
+          f"针距 {plan.needle_pitch_mm:g} mm，伺服目标 {plan.servo_target_mm:g} mm")
+    print(f"滑台行程 {row.slide_travel_mm:.4g} mm；"
+          f"针长等差步长 {step:+.4g} mm（这套针组只配 {row.angle_deg:+g}° 这个符号）")
+    if datum is not None:
+        head = plan.placements[0].cnc_x_mm
+        tail = plan.placements[-1].cnc_x_mm
+        # 最高点在排尾还是排头由 θ 的符号决定，而它决定排间抬刀会不会扎进管子，
+        # 所以必须说出来，不能让操作员自己从两个数里推。
+        side = "排尾" if row.slope >= 0 else "排头"
+        print(f"排内工作 Z：排头 {work_z_mm(plan, head, datum):+.3f} -> "
+              f"排尾 {work_z_mm(plan, tail, datum):+.3f} mm"
+              f"（最高 {highest_work_z_mm(plan, datum):+.3f} mm，在{side}）")
 
 
-def run_simulation(job: JobSpec, *, inject_failure: bool = False) -> int:
-    plan = plan_grid(job, _known_geometry())
-    motion = HeadMotion(standby_mm=0, insertion_mm=-5,
+#: RunState 的枚举名是数据契约——reporting.py 把 .name 原样写进 JSON 摘要，
+#: 所以枚举本身不能改。终端上要走这张表，两者互不影响。
+_STATE_CN = {RunState.READY: "就绪", RunState.RUNNING: "运行中",
+             RunState.WAITING_OPERATOR: "等待操作员", RunState.COMPLETE: "已完成",
+             RunState.STOPPED: "已停止", RunState.FAULT: "故障"}
+
+
+def _result_line(result) -> str:
+    return (f"{_STATE_CN[result.state]}：{result.completed_placements} 个落点，"
+            f"共 {result.completed_rows} 排（每排 {result.placements_per_row} 个）"
+            + (f"；{result.error}" if result.error else ""))
+
+
+def run_simulation(row: RowSpec, *, inject_failure: bool = False, rows: int = 1,
+                   datum=SMOKE_DATUM, scan_z_mm: float = SMOKE_SCAN_Z_MM) -> int:
+    plan = plan_row(row, _known_geometry())
+    motion = HeadMotion(standby_mm=0, insertion_mm=-row.slide_travel_mm,
                         work_min_mm=-10, work_max_mm=0, datum_confirmed=True)
-    rig = SimulationRig(standby_mm=motion.standby_mm, scan_z_mm=0,
-                        fail_on_first_descent=inject_failure)
+    rig = SimulationRig(standby_mm=motion.standby_mm, scan_z_mm=scan_z_mm,
+                        fail_on_first_descent=inject_failure,
+                        slope=plan.slope, datum=datum)
     rig.servo.enable()
     rig.servo.set_zero()
     rig.head.zero()
     coordinator = Coordinator(rig.servo, rig.cnc, rig.head, motion,
-                              scan_z_mm=0, operator_confirmed=True, valve_delay_s=0,
+                              scan_z_mm=scan_z_mm, operator_confirmed=True,
+                              z_datum=datum, valve_delay_s=0,
                               confirm_next=lambda done, total, cancel: not cancel.is_set())
-    _print_plan(job, plan)
-    result = coordinator.run(plan)
-    print(f"{result.state.name}: {result.completed_placements}/{result.total_placements} placements"
-          + (f"; {result.error}" if result.error else ""))
-    print("valves closed" if rig.valves_closed else "VALVE STATE UNSAFE")
-    return 0 if result.state is RunState.COMPLETE and rig.valves_closed else 1
+    _print_plan(row, plan, datum=datum)
+    confirm_next_row = None
+    if rows > 1:
+        confirm_next_row = lambda completed_rows, cancel: (   # noqa: E731
+            not cancel.is_set() and completed_rows < rows)
+    result = coordinator.run(plan, confirm_next_row=confirm_next_row)
+    print(_result_line(result))
+    print("阀门已关闭" if rig.valves_closed else "阀门状态不安全")
+    if rig.geometry_errors:
+        for message in rig.geometry_errors:
+            print(f"几何校验：{message}")
+    return 0 if (result.state is RunState.COMPLETE and rig.valves_closed
+                 and not rig.geometry_errors) else 1
 
 
 def _read_live_configuration(path: Path, confirmed: bool,
-                             job_overrides: dict[str, float] | None = None):
+                             job_overrides: dict[str, float] | None = None, *,
+                             datum: tuple[float, float] | None = None):
     if not confirmed:
-        raise ValueError("configuration: --confirm-datum is required for live mode")
+        raise ValueError("配置：实机模式必须给出 --confirm-datum")
     # 模板 + 同级的 config.local.toml（向导生成）。本机文件不存在时完全等价于只读模板。
     cfg = load_merged(path)
 
     def required(section: str, key: str):
         value = cfg.get(section, {}).get(key)
         if value is None or value == "":
-            raise ValueError(f"configuration: [{section}] {key} is required")
+            raise ValueError(f"配置：[{section}] {key} 必填")
         return value
 
     overrides = job_overrides or {}
     unknown = set(overrides) - set(JOB_KEYS)
     if unknown:
-        raise ValueError(f"configuration: unknown job override {', '.join(sorted(unknown))}")
+        raise ValueError(f"配置：未知的作业覆盖项 {', '.join(sorted(unknown))}")
     # 模板刻意注释掉了 [job]：明确传入的覆盖项可以补齐缺失的键，没传的仍然必须来自配置。
     job_defaults = {key: overrides[key] if key in overrides else required("job", key)
                     for key in JOB_KEYS}
-    job = JobSpec(**job_defaults)
+    row = RowSpec(**job_defaults)
     geometry = _known_geometry()
     lead = required("servo", "lead_mm")
     if abs(lead - geometry.servo_lead_mm) > 1e-4:
-        raise ValueError("configuration: servo lead_mm conflicts with measured calibration")
+        raise ValueError("配置：servo lead_mm 与实测标定冲突")
     required("servo", "adapter")
     required("cnc3d", "port")
     required("head", "port")
     if cfg["cnc3d"]["port"] == cfg["head"]["port"]:
-        raise ValueError("configuration: CNC and head must use different ports")
+        raise ValueError("配置：CNC 与滑台不能使用同一个串口")
     if required("head", "firmware_verified") is not True:
-        raise ValueError("configuration: head firmware_verified must be true")
+        raise ValueError("配置：head firmware_verified 必须为 true")
+    if datum is None:
+        raise ValueError("配置：实机模式必须给出对刀点 (x0, z0)")
+    if len(datum) != 2 or not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                                  and math.isfinite(value) for value in datum):
+        raise ValueError("配置：对刀点 (x0, z0) 必须是两个有限数")
+    # insertion_mm 不再手填：深度沿垂直管面量，滑台行程 = depth/cos(theta)。
+    # [head] 段仍然要有待机与工作窗口，但下行目标是推导出来的。
     motion = HeadMotion(standby_mm=required("head", "standby_mm"),
-                        insertion_mm=required("head", "insertion_mm"),
+                        insertion_mm=-row.slide_travel_mm,
                         work_min_mm=required("head", "work_min_mm"),
                         work_max_mm=required("head", "work_max_mm"),
                         datum_confirmed=required("head", "datum_confirmed"))
     if not -10 <= motion.work_min_mm < motion.insertion_mm < motion.standby_mm == 0 == motion.work_max_mm:
-        raise ValueError("configuration: head must use tested negative descent window [-10, 0] and standby zero")
+        raise ValueError("配置：head 必须使用实测过的负向下行窗口 [-10, 0] 与零位待机")
     if required("cycle", "upper_release_after_retract") is not True:
-        raise ValueError("configuration: only verified upper-valve release protocol is supported")
+        raise ValueError("配置：只支持已在实机验证过的上阀释放流程")
     scan_z = required("cnc3d", "scan_z_mm")
-    if not 0 <= scan_z <= required("cnc3d", "z_max"):
-        raise ValueError("configuration: scan_z_mm outside CNC Z limit")
-    plan = plan_grid(job, geometry)
+    # 只查上界。这些限位是 work-coordinate limit（见 config.toml 注释），工件坐标本来
+    # 就可负：对刀点 z0 允许为负（测试里 --datum-z -5 就是合法的），安全高度在同一个
+    # 坐标系里读回来自然也可是负的。硬加 ">= 0" 会逼操作员在向导从没要求过的地方重设
+    # Z 工件零点。真正防扎管的是下面那条"必须高过排内最高工作点"。
+    if scan_z > required("cnc3d", "z_max"):
+        raise ValueError("配置：scan_z_mm 超出 CNC Z 软限位")
+    plan = plan_row(row, geometry)
     if (max(p.cnc_x_mm for p in plan.placements) > required("cnc3d", "x_max")
             or max(p.cnc_y_mm for p in plan.placements) > required("cnc3d", "y_max")):
-        raise ValueError("configuration: planned CNC location exceeds X/Y soft limit")
-    return cfg, job, geometry, motion, scan_z, plan
+        raise ValueError("配置：排程落点超出 CNC X/Y 软限位")
+    # 排间安全高度必须高过排内**最高**的工作点。theta 带符号：正角时最高点在排尾、
+    # 负角时在排头。写成 min 或假定单调，负角下"抬到安全高度"会变成向下扎进管子。
+    highest = highest_work_z_mm(plan, datum)
+    if scan_z + 1e-9 < highest:
+        raise ValueError(
+            f"配置：scan_z_mm {scan_z:g} mm 低于排内最高工作点 {highest:+.3f} mm；"
+            f"照这个高度抬刀，排间移动会扎进管子")
+    return cfg, row, geometry, motion, scan_z, plan, datum
 
 
-def _read_stop_commands(commands: queue.Queue[str], *, echo=None) -> None:
+def _read_stop_commands(commands: queue.Queue[str], *, echo=None,
+                        stopped: threading.Event | None = None) -> None:
+    """后台读急停指令；`stopped` 置起后读到什么都不再投递。
+
+    这个线程阻塞在 input() 上，从外面打断不了——所以它是 daemon，运行结束后也不会
+    自己退出。加这道闸是为了让它在运行**结束后**读到的那一行不被当成指令：否则操作员
+    敲给下一个提示（菜单、下一次运行）的那一下会被这个线程吃掉。
+    """
     prompt = "运行中，输入 ! 急停 > "
     while True:
         try:
             if echo is not None:
                 # 回显行会 \r 擦掉提示行，所以擦之前先让它知道提示语是什么。
                 echo.hold_prompt(prompt)
-            commands.put(input(prompt).strip())
+            line = input(prompt).strip()
         except EOFError:
-            commands.put("EOF")
+            if stopped is None or not stopped.is_set():
+                commands.put("EOF")
             return
         finally:
             if echo is not None:
                 echo.release_prompt()
+        if stopped is not None and stopped.is_set():
+            return
+        commands.put(line)
 
 
 # 点动单步上限。机构余量很小，人眼也跟不上更大的步长。
@@ -211,6 +284,63 @@ def _prepare_live_zeros(servo, head, *, menu=None) -> bool:
             menu.warn(f"设置失败：{exc}")
 
 
+class RowTurnGate:
+    """排间确认：一排跑完后等操作员剪丝并把管子转过一个周向位置。
+
+    机器没有回转轴，所以程序既不校验也不提示转了多少度——只等人按确认。
+    与 `OperatorGate` 同一套令牌握手，只是文案不同；主循环按当前等待方分派。
+    """
+
+    def __init__(self, *, output=None):
+        self.output = output if output is not None else sys.stdout
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._token: str | None = None
+        self._answer = False
+
+    @property
+    def waiting_token(self) -> str | None:
+        with self._lock:
+            return self._token
+
+    def wait_for_turn(self, completed_rows: int, cancel: threading.Event) -> bool:
+        token = secrets.token_hex(3).upper()
+        with self._lock:
+            self._ready.clear()
+            self._token = token
+            self._answer = False
+        print(f"第 {completed_rows} 排已完成：滑台已抬到安全高度并回到排头。"
+              f"请剪断五根丝、把管子转过一个周向位置，确认后输入 READY {token} "
+              f"再跑一模一样的一排；不再跑下一排请输入 DONE；输入 ! 停止。",
+              file=self.output, flush=True)
+        try:
+            while not cancel.is_set():
+                if self._ready.wait(0.05):
+                    return self._answer and not cancel.is_set()
+            return False
+        finally:
+            with self._lock:
+                self._token = None
+                self._ready.clear()
+
+    def submit(self, command: str) -> bool:
+        with self._lock:
+            if self._token is None or command.strip().upper() != f"READY {self._token}":
+                return False
+            self._answer = True
+            self._ready.set()
+            return True
+
+    def decline(self, command: str) -> bool:
+        """DONE 是正常收工，不是急停——否则操作员会学会习惯性按 !，那才是危险。"""
+        with self._lock:
+            if self._token is None or command.strip().upper() not in ("DONE", "完成"):
+                return False
+            self._answer = False
+            self._ready.set()
+            return True
+
+
 @dataclass
 class LiveDevices:
     servo: object
@@ -229,6 +359,32 @@ def _make_echo(debug: bool):
     return DeviceEcho()
 
 
+def _open_head_serial(port, baud, **kwargs):
+    """打开滑台串口，但不碰 DTR/RTS——否则等于替操作员按了一次复位键。
+
+    CH340 的 DTR/RTS 经板上三极管接到 ESP32 的 EN 和 GPIO0，所以
+    serial.Serial(端口, 波特率, ...) 这种"构造即打开"的写法会在 open() 的瞬间热复位芯片。
+    而 GPIO12 既是 MTDI strapping 脚、又接着 CNC Shield 上 A4988 的 EN：热复位时它被拉
+    高，VDD_SDIO 掉到 1.8V，3.3V 的板载 flash 整个读不到 → ROM 报
+    invalid header: 0xffffffff → RTCWDT 循环，且不会自行恢复。冷启动没这个竞态（5V 轨
+    还在爬升），所以只有"连接"这一次会打坏它。见 findings.md 2026-09-28 追加。
+
+    pyserial 的构造器不接受 dtr=/rts= 关键字，只能先构造、设属性、再 open()。
+    延迟 import serial：仿真与自检路径不该因为没装 pyserial 就跑不起来。
+    """
+    import serial
+
+    ser = serial.Serial()
+    ser.port = port
+    ser.baudrate = baud
+    for name, value in kwargs.items():
+        setattr(ser, name, value)
+    ser.dtr = False
+    ser.rts = False
+    ser.open()
+    return ser
+
+
 def _open_live_devices(cfg: dict, geometry: MachineGeometry, motion: HeadMotion, *,
                        echo=None) -> LiveDevices:
     """只构造对象，不碰硬件。连接失败前不会有任何动作。"""
@@ -242,7 +398,8 @@ def _open_live_devices(cfg: dict, geometry: MachineGeometry, motion: HeadMotion,
         cnc=Cnc3D(port=cn["port"], baud=cn["baud"], feed=cn["feed"],
                   limits=(cn["x_max"], cn["y_max"], cn["z_max"]), echo=echo),
         head=InsertHead(port=hd["port"], baud=hd["baud"],
-                        travel_mm=hd["travel_mm"], motion=motion, echo=echo))
+                        travel_mm=hd["travel_mm"], motion=motion, echo=echo,
+                        serial_factory=_open_head_serial))
 
 
 def _connect_live_devices(devices: LiveDevices) -> None:
@@ -258,57 +415,79 @@ def _connect_live_devices(devices: LiveDevices) -> None:
             raise RuntimeError(f"{label} 连接失败：{exc}") from exc
 
 
-def _close_live_devices(devices: LiveDevices) -> None:
+def _close_live_devices(devices: LiveDevices) -> list[str]:
+    """收尾：关阀、卸伺服使能、关三路。返回没能确认完成的动作，并逐条上屏。
+
+    这里原本是三处 `except Exception: pass`。收尾失败被静默吞掉，等于「程序说它关好了」
+    和「它真的关好了」之间的差别没人看得见——而关阀正是安全动作本身。
+
+    收尾仍要全部做完：一个失败不该拦住后面两路关闭。所以是先收集、最后统一报。
+    """
+    failures: list[str] = []
     if devices.head.connected:
         for which in ("a", "b"):
             try:
                 devices.head.valve(which, False)
-            except Exception:
-                pass
+            except Exception as exc:
+                failures.append(f"关闭 {which} 阀失败：{exc}")
     try:
         devices.servo.disable()
-    except Exception:
-        pass
-    for device in (devices.head, devices.cnc, devices.servo):
+    except Exception as exc:
+        failures.append(f"伺服卸使能失败：{exc}")
+    for name, device in (("滑台", devices.head), ("三维模组", devices.cnc),
+                         ("伺服", devices.servo)):
         try:
             device.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            failures.append(f"关闭{name}失败：{exc}")
+    for message in failures:
+        print(f"警告：{message}")
+    return failures
 
 
-def _make_reporter(job, plan, motion, scan_z, results_dir):
+def _make_reporter(row, plan, motion, scan_z, results_dir, *, datum=None):
     if results_dir is None:
         return None
     from master.reporting import RunReporter
     try:
-        return RunReporter(job=job, plan=plan, machine=_known_geometry(), motion=motion,
-                           scan_z_mm=scan_z, out_dir=results_dir)
+        return RunReporter(job=row, plan=plan, machine=_known_geometry(), motion=motion,
+                           scan_z_mm=scan_z, datum=datum, out_dir=results_dir)
     except Exception as exc:
         print(f"警告：无法创建结果文件（{exc}），本次运行不记录。")
         return None
 
 
-def _execute_live_job(cfg: dict, job: JobSpec, motion: HeadMotion, scan_z: float,
-                      plan, devices: LiveDevices, *, results_dir: Path | None = None,
-                      echo=None) -> int:
+def _execute_live_job(cfg: dict, row: RowSpec, motion: HeadMotion, scan_z: float,
+                      plan, devices: LiveDevices, *, datum=None, rows: int | None = None,
+                      results_dir: Path | None = None, echo=None) -> int:
     gate = OperatorGate()
-    reporter = _make_reporter(job, plan, motion, scan_z, results_dir)
+    turn_gate = RowTurnGate()
+    reporter = _make_reporter(row, plan, motion, scan_z, results_dir, datum=datum)
     coordinator = Coordinator(devices.servo, devices.cnc, devices.head, motion,
-                              scan_z_mm=scan_z, operator_confirmed=True,
+                              scan_z_mm=scan_z, operator_confirmed=True, z_datum=datum,
                               valve_delay_s=cfg["cycle"]["valve_delay_ms"] / 1000,
                               confirm_next=gate.wait_for_ready,
                               progress=reporter)
+
+    def confirm_next_row(completed_rows: int, cancel: threading.Event) -> bool:
+        """一排跑完 → 抬到安全高度、回排头 → 等人工剪丝转管。默认一直跑下去。"""
+        if rows is not None and completed_rows >= rows:
+            return False
+        return turn_gate.wait_for_turn(completed_rows, cancel)
+
     print("实时运行：输入 ! 可请求三路停止。每次五针退回且 B 阀排气后，"
-          "请剪丝并按屏幕提示输入 READY 代码，才会移动到下一落点。")
+          "请剪丝并按屏幕提示输入 READY 代码，才会移动到下一落点。"
+          "一排跑完后滑台抬到安全高度并回到排头，等人工剪丝转管后确认再跑下一排。")
     commands: queue.Queue[str] = queue.Queue()
+    stop_reading = threading.Event()
     reader = threading.Thread(target=_read_stop_commands, args=(commands,),
-                              kwargs={"echo": echo}, daemon=True)
+                              kwargs={"echo": echo, "stopped": stop_reading}, daemon=True)
     reader.start()
     holder: list = []
 
     def execute() -> None:
         try:
-            holder.append(coordinator.run(plan))
+            holder.append(coordinator.run(plan, confirm_next_row=confirm_next_row))
         except Exception as exc:
             holder.append(exc)
 
@@ -319,47 +498,62 @@ def _execute_live_job(cfg: dict, job: JobSpec, motion: HeadMotion, scan_z: float
             command = commands.get(timeout=0.1)
             if command in ("!", "EOF"):
                 coordinator.request_stop()
-            elif command.upper().startswith("READY") and not gate.submit(command):
+            elif turn_gate.decline(command):
+                print("不再跑下一排，本次作业正常收工。")
+            elif (command.upper().startswith("READY")
+                  and not (gate.submit(command) or turn_gate.submit(command))):
                 print("确认码无效或当前未等待剪丝；下一落点仍未放行。")
         except queue.Empty:
             pass
         except KeyboardInterrupt:
             coordinator.request_stop()
     worker.join()
+    # 运行结束：让读取线程读到下一行时闭嘴。它多半还阻塞在 input() 上，join 不回来，
+    # 所以只置标志不 join——置了标志它就绝不会再把后续输入当成急停指令。
+    stop_reading.set()
     if not holder or isinstance(holder[0], Exception):
-        raise RuntimeError(f"live coordinator failed before motion: {holder[0] if holder else 'no result'}")
+        raise RuntimeError(f"实机总控在动作前失败：{holder[0] if holder else '没有返回结果'}")
     result = holder[0]
-    print(f"{result.state.name}: {result.completed_placements}/{result.total_placements} placements"
-          + (f"; {result.error}" if result.error else ""))
+    print(_result_line(result))
     for message in coordinator.progress_errors:
         print(f"警告：结果记录失败：{message}")
     if reporter is not None:
         artifacts = reporter.finish(result)
+        # reporter.errors 是记录器自己攒下的失败（开不了文件、写不进行、摘要没写成）。
+        # 它不会抛异常——_fail() 只往列表里追加——所以 progress_errors 那条通道永远
+        # 捕不到它，除了这里没有第二个地方会告诉操作员"这份记录不完整"。JSON 里的
+        # recording_errors 是给机器看的；人得看屏幕。
+        for message in reporter.errors:
+            print(f"警告：结果记录失败：{message}")
         if artifacts is not None:
             print(f"结果已保存：{artifacts[0]}；摘要 {artifacts[1]}")
+        else:
+            print("警告：本次结果文件没有写成，跑过的落点无从追溯。")
     return 0 if result.state is RunState.COMPLETE else 1
 
 
 def run_live(config_path: Path, confirmed: bool,
              job_overrides: dict[str, float] | None = None, *,
+             datum: tuple[float, float] | None = None, rows: int | None = None,
              results_dir: Path | None = None, debug: bool = False) -> int:
-    cfg, job, geometry, motion, scan_z, plan = _read_live_configuration(
-        config_path, confirmed, job_overrides)
+    cfg, row, geometry, motion, scan_z, plan, datum = _read_live_configuration(
+        config_path, confirmed, job_overrides, datum=datum)
     echo = _make_echo(debug)
     devices = _open_live_devices(cfg, geometry, motion, echo=echo)
     if results_dir is None:
         results_dir = Path(config_path).parent / "runs"
     try:
         _connect_live_devices(devices)
-        _print_plan(job, plan)
+        _print_plan(row, plan, datum=datum)
         print(f"连接后状态：CNC WPos={devices.cnc.position()}，"
               f"滑台软件读数={devices.head.position_mm():.3f} mm；"
-              f"预期扫描 Z={scan_z:g} mm。读数不能证明机械零位。")
+              f"预期安全高度 Z={scan_z:g} mm，对刀点 X={datum[0]:g} Z={datum[1]:g} mm。"
+              f"读数不能证明机械零位。")
         if not _prepare_live_zeros(devices.servo, devices.head):
             print("已取消，未开始自动植入。")
             return 1
-        return _execute_live_job(cfg, job, motion, scan_z, plan, devices,
-                                 results_dir=results_dir, echo=echo)
+        return _execute_live_job(cfg, row, motion, scan_z, plan, devices, datum=datum,
+                                 rows=rows, results_dir=results_dir, echo=echo)
     finally:
         _close_live_devices(devices)
 
@@ -371,10 +565,15 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--smoke-test", action="store_true", help="run full reference job without hardware")
     mode.add_argument("--simulate", action="store_true", help="run a specified job without hardware")
     mode.add_argument("--live", action="store_true", help="connect to actual machine after preflight")
-    parser.add_argument("--width", type=float)
-    parser.add_argument("--height", type=float)
-    parser.add_argument("--spacing", type=float)
-    parser.add_argument("--thickness", type=float)
+    parser.add_argument("--angle", type=float,
+                        help="架子角度 θ（度，带符号；正值 = 管面朝 +x 上升）")
+    parser.add_argument("--length", type=float, help="一排的强化区长度 mm")
+    parser.add_argument("--spacing", type=float, help="点距 mm")
+    parser.add_argument("--depth", type=float, help="沿垂直管面的植入深度 mm（1-3）")
+    parser.add_argument("--datum-x", type=float, help="对刀点的 CNC X mm（非交互实机路径必填）")
+    parser.add_argument("--datum-z", type=float, help="对刀点的 CNC Z mm（非交互实机路径必填）")
+    parser.add_argument("--rows", type=int,
+                        help="实机跑多少排后正常收工；不给就一直跑到操作员叫停")
     parser.add_argument("--inject-failure", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--config", type=Path, default=default_config_path())
     parser.add_argument("--confirm-datum", action="store_true",
@@ -397,8 +596,8 @@ def main(argv: list[str] | None = None) -> int:
                                     results_dir=args.results_dir, debug=args.debug)
         if args.live:
             overrides = {key: value for key, value in
-                         (("width_mm", args.width), ("height_mm", args.height),
-                          ("spacing_mm", args.spacing), ("plate_thickness_mm", args.thickness))
+                         (("angle_deg", args.angle), ("length_mm", args.length),
+                          ("spacing_mm", args.spacing), ("depth_mm", args.depth))
                          if value is not None}
             if not args.confirm_datum:
                 # 没有 --confirm-datum 就进交互向导；分派放在这里而不是 run_live 里，
@@ -406,16 +605,32 @@ def main(argv: list[str] | None = None) -> int:
                 from master.wizard import run_setup_wizard
                 return run_setup_wizard(args.config, job_overrides=overrides,
                                         results_dir=args.results_dir, debug=args.debug)
+            if (args.datum_x is None) != (args.datum_z is None):
+                raise ValueError("配置：--datum-x 和 --datum-z 必须一起给出")
+            datum = None if args.datum_x is None else (args.datum_x, args.datum_z)
             extra = {} if args.results_dir is None else {"results_dir": args.results_dir}
+            if args.rows is not None:
+                # --rows 是"跑完第 N 排就正常收工"，而判据在**每一排跑完之后**才看
+                # （coordinator 先跑排、再调 confirm_next_row）。所以 0 或负数不是
+                # "不跑"，是"跑完第一排才发现该停"——机器会真的走完一整排。宁可在这里
+                # 拒掉，也不能让操作员以为它什么都不做。
+                if args.rows < 1:
+                    raise ValueError(f"配置：--rows 必须 ≥ 1（给的是 {args.rows}）")
+                extra["rows"] = args.rows
             return run_live(args.config, args.confirm_datum, job_overrides=overrides,
-                            debug=args.debug, **extra)
-        job = JobSpec(args.width if args.width is not None else 360,
-                      args.height if args.height is not None else 360,
-                      args.spacing if args.spacing is not None else 4,
-                      args.thickness if args.thickness is not None else 5)
-        return run_simulation(job, inject_failure=args.inject_failure)
-    except (ValueError, RuntimeError, KeyError, TypeError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+                            datum=datum, debug=args.debug, **extra)
+        row = RowSpec(*[value if value is not None else SMOKE_JOB[key]
+                        for key, value in (("angle_deg", args.angle),
+                                           ("length_mm", args.length),
+                                           ("spacing_mm", args.spacing),
+                                           ("depth_mm", args.depth))])
+        return run_simulation(row, inject_failure=args.inject_failure,
+                              rows=SMOKE_ROWS if args.smoke_test else 1)
+    # OSError 必须显式列出：TimeoutError、SerialException、FileNotFoundError 都是它
+    # 的子类，一个都不在上面四种里。漏掉它们的后果不是少一句提示——异常会穿透出去，
+    # 打包后的 exe 把 traceback 打到 stderr 就退出，而双击启动没有 pause，窗口直接消失。
+    except (ValueError, RuntimeError, KeyError, TypeError, OSError) as exc:
+        print(f"错误：{exc}", file=sys.stderr)
         return 2
 
 

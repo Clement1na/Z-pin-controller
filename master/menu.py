@@ -29,9 +29,13 @@ def run_startup_menu(*, config_path, results_dir=None, debug=False, menu=None,
 
     选定一项就执行并返回它的退出码，**不弹回菜单**：实机跑完机器处于需要人工
     处理的状态，自动再来一轮是危险的默认值。
+
+    跑完会停住等回车。双击 exe 启动时控制台是新的，进程一退窗口就关，操作员
+    连结果都来不及看——停顿只加在这条交互路径上；`--smoke-test` / `--simulate`
+    这类脚本化调用不受影响，否则自动化会挂在那里等输入。
     """
-    from master.master import _known_geometry, run_simulation
-    from master.model import JobSpec
+    from master.master import SMOKE_JOB, SMOKE_ROWS, _known_geometry, run_simulation
+    from master.model import RowSpec
     from master.wizard import WizardCancelled, collect_job, run_setup_wizard
 
     menu = make_menu() if menu is None else menu
@@ -45,7 +49,9 @@ def run_startup_menu(*, config_path, results_dir=None, debug=False, menu=None,
             choice = menu.choose("选择", (
                 ("1", "实机运行（会连接并可能移动机构）"),
                 ("2", "仿真（不接硬件）"),
-                ("3", "自检（参考作业 360×360/4/5）"),
+                ("3", f"自检（参考作业 θ=+{SMOKE_JOB['angle_deg']:g}° / 强化区 "
+                      f"{SMOKE_JOB['length_mm']:g} / 点距 {SMOKE_JOB['spacing_mm']:g} / "
+                      f"{SMOKE_ROWS} 排）"),
                 ("4", f"调试输出：{'开' if debug_on else '关'}"),
                 ("0", "退出"),
             ))
@@ -59,8 +65,34 @@ def run_startup_menu(*, config_path, results_dir=None, debug=False, menu=None,
         if choice == "0":
             return 0
         if choice == "1":
-            return wizard_fn(Path(config_path), results_dir=results_dir, debug=debug_on)
-        if choice == "2":
-            job, _ = collect_job(menu, _known_geometry())
-            return simulate_fn(job)
-        return simulate_fn(JobSpec(360.0, 360.0, 4.0, 5.0))
+            code = wizard_fn(Path(config_path), results_dir=results_dir, debug=debug_on)
+        elif choice == "2":
+            # 参数问答也必须接住取消。`menu.choose` 上面裹了，这里不裹的话 `Q`/Ctrl-C
+            # 会让 WizardCancelled 一路逃出 main 的 except 元组，未捕获异常直接结束进程
+            # ——双击启动时就是窗口一闪而过，操作员看不到任何解释。
+            try:
+                row, _ = collect_job(menu, _known_geometry())
+            except WizardCancelled as exc:
+                menu.say(f"已取消（{exc}），未开始仿真；回到菜单。")
+                continue
+            code = simulate_fn(row)
+        else:
+            code = simulate_fn(RowSpec(**SMOKE_JOB), rows=SMOKE_ROWS)
+        _hold_before_exit(menu)
+        return code
+
+
+def _hold_before_exit(menu) -> None:
+    """停住等回车，让操作员看清屏幕再让窗口关闭。
+
+    走 `menu.ask` 是为了复用同一个输入接缝：测试能喂一个回车进来。回车以外的
+    任何反应（`Q`、Ctrl-C、stdin 已关闭）都当作"知道了，走吧"——这一步是礼貌，
+    不是安全联锁，不该因为它再抛一次异常把进程带走。
+    """
+    from master.wizard import WizardCancelled
+
+    menu.say("")
+    try:
+        menu.ask("按回车退出")
+    except WizardCancelled:
+        pass

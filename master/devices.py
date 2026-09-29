@@ -58,11 +58,11 @@ class ServoAxis:
         if self.connected:
             return
         if not self.adapter:
-            raise ValueError("EtherCAT adapter must be selected explicitly")
+            raise ValueError("必须先明确选择 EtherCAT 网卡")
         if self.device_factory is None:
             from sv630n_pc import LEAD_MM, Sv630n
             if not math.isclose(self.lead_mm, LEAD_MM, rel_tol=1e-6):
-                raise ValueError("servo lead_mm differs from calibrated LEAD_MM")
+                raise ValueError("伺服 lead_mm 与标定的 LEAD_MM 不一致")
             factory = Sv630n
             # 配置里存的是人类可读的网卡描述；只有真实硬件路径才解析成 pysoem 设备名。
             # 注入 device_factory 的测试用的是 "fake-wired" 这类假值，绝不能去查真实网卡。
@@ -98,25 +98,25 @@ class ServoAxis:
             time.sleep(0.01)
         if not dev.status["wkc_ok"]:
             self._say_rx("链路故障：工作计数器始终无效")
-            raise TimeoutError("EtherCAT working counter did not become valid")
+            raise TimeoutError("EtherCAT 工作计数器始终无效")
         self._say_rx(f"链路故障 状态字=0x{dev.status['sw']:04X}")
-        raise RuntimeError(f"servo fault on connect: 状态字=0x{dev.status['sw']:04X}")
+        raise RuntimeError(f"伺服连接时故障：状态字=0x{dev.status['sw']:04X}")
 
     def _wait_ready(self, dev) -> None:
         deadline = time.monotonic() + self.timeout_s
         while time.monotonic() < deadline:
             if self.cancel_event is not None and self.cancel_event.is_set():
-                raise RuntimeError("servo wait cancelled")
+                raise RuntimeError("伺服等待被取消")
             status = dev.status
             if status["sw"] & 0x0008:
                 self._say_rx(f"故障 状态字=0x{status['sw']:04X}")
-                raise RuntimeError(f"servo fault before motion: 状态字=0x{status['sw']:04X}")
+                raise RuntimeError(f"伺服动作前故障：状态字=0x{status['sw']:04X}")
             if status["wkc_ok"] and status["sw"] & 0x006F == 0x0027:
                 return
             time.sleep(0.01)
         if not dev.status["wkc_ok"]:
-            raise TimeoutError("EtherCAT working counter did not become valid")
-        raise TimeoutError("servo did not reach operation enabled state")
+            raise TimeoutError("EtherCAT 工作计数器始终无效")
+        raise TimeoutError("伺服未进入使能就绪状态")
 
     def close(self) -> None:
         self.origin_count = None
@@ -136,26 +136,26 @@ class ServoAxis:
         if not self.connected:
             raise RuntimeError("伺服未连接")
         if self.origin_count is None:
-            raise RuntimeError("servo logical zero has not been set")
+            raise RuntimeError("伺服逻辑零位尚未设置")
         return self._count2mm(self.dev.status["apos"] - self.origin_count)
 
     @property
     def raw_position_mm(self) -> float:
         if not self.connected:
-            raise RuntimeError("servo is not connected")
+            raise RuntimeError("伺服未连接")
         return self._count2mm(self.dev.status["apos"])
 
     @property
     def setup_offset_mm(self) -> float:
         if not self.connected or self.boot_count is None:
-            raise RuntimeError("servo boot reference is unavailable")
+            raise RuntimeError("伺服上电基准不可用")
         return self._count2mm(self.dev.status["apos"] - self.boot_count)
 
     def set_zero(self) -> None:
         if not self.connected:
-            raise RuntimeError("servo is not connected")
+            raise RuntimeError("伺服未连接")
         if not self.dev.enable:
-            raise RuntimeError("servo must be explicitly enabled before setting zero")
+            raise RuntimeError("设置零位前必须先使能伺服")
         self._say_tx("记录当前点为本次连接的伺服逻辑零位")
         self._wait_ready(self.dev)
         self.origin_count = self.dev.status["apos"]
@@ -163,16 +163,16 @@ class ServoAxis:
     def jog_setup_mm(self, delta_mm: float) -> None:
         """Small boot-relative manual move before the closed position is zeroed."""
         if not self.connected:
-            raise RuntimeError("servo is not connected")
+            raise RuntimeError("伺服未连接")
         if not self.dev.enable:
-            raise RuntimeError("servo must be explicitly enabled before setup jog")
+            raise RuntimeError("点动前必须先使能伺服")
         if self.origin_count is not None:
-            raise RuntimeError("setup jog is only available before servo zero")
+            raise RuntimeError("点动只能在伺服设零之前进行")
         if not math.isfinite(delta_mm) or not 0 < abs(delta_mm) <= 0.5:
-            raise ValueError("manual servo jog must be nonzero and at most 0.5 mm")
+            raise ValueError("手动点动距离必须非零且不超过 0.5 mm")
         target = self.dev.status["apos"] + self._mm2count(delta_mm)
         if abs(self._count2mm(target - self.boot_count)) > self.max_expansion_mm + 1e-6:
-            raise ValueError("manual servo jog exceeds boot-relative 10 mm guard")
+            raise ValueError("手动点动超出相对上电基准 10 mm 的保护范围")
         self._say_tx(f"点动 {delta_mm:+.3f} mm")
         self._move_raw(target, self.vel_mm_s)
 
@@ -181,19 +181,19 @@ class ServoAxis:
         if not self.connected:
             raise RuntimeError("伺服未连接")
         if not math.isfinite(mm) or not -self.max_expansion_mm <= mm <= 0:
-            raise ValueError(f"servo target outside calibrated range [-{self.max_expansion_mm}, 0] mm")
+            raise ValueError(f"伺服目标超出标定范围 [-{self.max_expansion_mm}, 0] mm")
         velocity = self.vel_mm_s if vel_mm_s is None else vel_mm_s
         if not math.isfinite(velocity) or velocity <= 0:
-            raise ValueError("servo velocity must be finite and positive")
+            raise ValueError("伺服速度必须是有限正数")
         if self.origin_count is None:
-            raise RuntimeError("servo logical zero has not been set")
+            raise RuntimeError("伺服逻辑零位尚未设置")
         target = self.origin_count + self._mm2count(mm)
         self._say_tx(f"绝对定位 {mm:+.3f} mm")
         self._move_raw(target, velocity)
 
     def _move_raw(self, target: int, velocity: float) -> None:
         if not self.dev.enable:
-            raise RuntimeError("servo must be enabled before motion")
+            raise RuntimeError("动作前必须使能伺服")
         self._wait_ready(self.dev)
         with self.dev.lock:
             self.dev.vel = self._mm2count(velocity)
@@ -202,19 +202,19 @@ class ServoAxis:
         tolerance = max(1, self._mm2count(0.05))
         while time.monotonic() < deadline:
             if self.cancel_event is not None and self.cancel_event.is_set():
-                raise RuntimeError("servo move cancelled")
+                raise RuntimeError("伺服动作被取消")
             status = self.dev.status
             if status["sw"] & 0x0008:
                 self._say_rx(f"故障 状态字=0x{status['sw']:04X}")
-                raise RuntimeError(f"servo fault during move: 状态字=0x{status['sw']:04X}")
+                raise RuntimeError(f"伺服运动中故障：状态字=0x{status['sw']:04X}")
             if not status["wkc_ok"]:
                 self._say_rx("工作计数器在运动中丢失")
-                raise RuntimeError("EtherCAT working counter lost during move")
+                raise RuntimeError("EtherCAT 工作计数器在运动中丢失")
             if status["sw"] & 0x0400 and abs(status["apos"] - target) <= tolerance:
                 self._say_rx(f"状态字=0x{status['sw']:04X} 到位")
                 return
             time.sleep(0.01)
-        raise TimeoutError("servo did not reach requested position")
+        raise TimeoutError("伺服未到达目标位置")
 
     def jog_mm(self, mm: float, vel_mm_s: float | None = None) -> None:
         """相对移动（变距）。"""
@@ -236,7 +236,7 @@ class ServoAxis:
 
     def enable(self) -> None:
         if not self.connected:
-            raise RuntimeError("servo is not connected")
+            raise RuntimeError("伺服未连接")
         self._say_tx("使能")
         self.dev.set_enabled(True)
         try:
@@ -278,7 +278,7 @@ class Cnc3D:
             rep = cnc.status()
             if (rep.state or "").lower().startswith("alarm"):
                 raise RuntimeError(
-                    f"CNC Alarm: operator must inspect and unlock manually ({rep.raw})")
+                    f"CNC 进入 Alarm 报警：需人工检查并解锁（{rep.raw}）")
             cnc.send("G21")
             cnc.send("G90")
         except Exception:
@@ -296,27 +296,31 @@ class Cnc3D:
         if not self.connected:
             raise RuntimeError("三维模组未连接")
         lx, ly, lz = self.limits
-        if not all(math.isfinite(v) for v in (x, y, z)) or not (0 <= x <= lx and 0 <= y <= ly and 0 <= z <= lz):
-            raise ValueError(f"目标 ({x},{y},{z}) 超出软限位 (0..{lx},0..{ly},0..{lz})")
+        # Z 只查上界。这三个是 work-coordinate limit，工件坐标本来就可负：对刀点是针尖
+        # 接触管顶母线的高度，排间安全高度与排内工作 Z 在同一个坐标系里读回来，自然也
+        # 是负的。硬加下界会逼操作员重设一个向导从没要求过的 Z 工件零点。X/Y 的下界
+        # 保留——排头就是 X=0，往负走是回到工件外面。防扎管靠的是排间安全高度那条检查。
+        if not all(math.isfinite(v) for v in (x, y, z)) or not (0 <= x <= lx and 0 <= y <= ly and z <= lz):
+            raise ValueError(f"目标 ({x},{y},{z}) 超出软限位 (X 0..{lx}, Y 0..{ly}, Z 上限 {lz})")
         chosen_feed = self.feed if feed is None else feed
         if not math.isfinite(chosen_feed) or chosen_feed <= 0:
-            raise ValueError("CNC feed must be positive")
+            raise ValueError("CNC 进给速度必须为正")
         self.cnc.send(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{chosen_feed}")
         deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline:
             if self.cancel_event is not None and self.cancel_event.is_set():
-                raise RuntimeError("CNC move cancelled")
+                raise RuntimeError("CNC 动作被取消")
             rep = self.cnc.status()
             state = (rep.state or "").lower()
             if state.startswith("alarm"):
-                raise RuntimeError(f"CNC entered Alarm during move: {rep.raw}")
+                raise RuntimeError(f"CNC 动作中进入 Alarm 报警：{rep.raw}")
             if state == "idle":
                 position = self.position()
                 if position is not None and all(abs(actual - target) <= 0.05
                                                 for actual, target in zip(position, (x, y, z))):
                     return
             time.sleep(0.1)
-        raise TimeoutError("CNC did not reach requested position")
+        raise TimeoutError("CNC 未到达目标位置")
 
     def position(self) -> tuple[float, float, float] | None:
         """读回 WPos (x,y,z) mm；解析失败返回 None。"""
@@ -382,7 +386,7 @@ class InsertHead:
             self._read_until(("ZPIN_HEAD_PROTOCOL=2",), 3.0)
         except Exception as exc:
             self.close()
-            raise RuntimeError("head firmware protocol 2 is required; flash and verify the current sketch") from exc
+            raise RuntimeError("滑台固件必须支持协议 2；请烧录并核对本仓库当前固件") from exc
 
     def close(self) -> None:
         self.zero_confirmed = False
@@ -416,9 +420,9 @@ class InsertHead:
                     self.echo.rx("GX28", line)
                 if "已紧急停止" in line:
                     self._stopped = True
-                    raise RuntimeError(f"head stopped; position is untrusted: {line}")
+                    raise RuntimeError(f"滑台已急停，位置不可信：{line}")
                 if line.startswith(("错误:", "ERROR:")):
-                    raise RuntimeError(f"head firmware error: {line}")
+                    raise RuntimeError(f"滑台固件报错：{line}")
                 if any(k in line for k in keywords):
                     return got
         raise TimeoutError(f"滑台应答超时（等待 {keywords}），已收: {got[-3:]}")
@@ -429,28 +433,28 @@ class InsertHead:
         lines = self._read_until(("当前位置",), 3.0)
         m = re.search(r"当前位置:\s*([-\d.]+)", lines[-1])
         if not m:
-            raise RuntimeError("head position reply is malformed")
+            raise RuntimeError("滑台位置回话格式不对")
         return float(m.group(1))
 
     def move_mm(self, mm: float, timeout: float = 30.0) -> float:
         """Move within the confirmed signed window after manual zero."""
         if self._stopped:
-            raise RuntimeError("head stopped; operator recovery is required")
+            raise RuntimeError("滑台已急停，需操作员手动恢复")
         if self.motion is None:
-            raise RuntimeError("head work window has not been confirmed")
+            raise RuntimeError("滑台工作窗口尚未确认")
         if not math.isfinite(mm) or not self.motion.work_min_mm <= mm <= self.motion.work_max_mm:
-            raise ValueError("head target outside confirmed work window")
+            raise ValueError("滑台目标超出已确认的工作窗口")
         if not self.zero_confirmed:
-            raise RuntimeError("head physical standby and software zero have not been confirmed")
+            raise RuntimeError("滑台物理待机位与软件零位尚未确认")
         self._send(f"{mm:.3f}")
         lines = self._read_until(("到达目标", "已紧急停止"), timeout)
         echoes = [re.search(r"移动到\s*([-\d.]+)\s*mm", line) for line in lines]
         targets = [float(match.group(1)) for match in echoes if match]
         if not targets or abs(targets[-1] - mm) > 0.011:
-            raise RuntimeError("head target mismatch: firmware may have clamped the command")
+            raise RuntimeError("滑台目标不一致：固件可能截断了下发值")
         readback = self.position_mm()
         if abs(readback - mm) > 0.05:
-            raise RuntimeError(f"head position readback {readback:g} mm differs from target {mm:g} mm")
+            raise RuntimeError(f"滑台位置回读 {readback:g} mm 与目标 {mm:g} mm 不符")
         return mm
 
     def zero(self) -> None:
@@ -473,12 +477,42 @@ class InsertHead:
         self._send(f"{which}{'1' if open_ else '0'}")
         self._read_until((f"气阀{which.upper()} 打开" if open_ else f"气阀{which.upper()} 关闭",), 3.0)
 
+    def _read_stop_ack(self, timeout: float = 1.0) -> None:
+        """读到 `q` 的回执为止。只回显，不判定，不抛。
+
+        固件的 emergencyStop() 只打一行「已紧急停止！位置已不准确，请重新 z 回零」，
+        所以读到这一行就够。**不能把缓冲区读空**——那等于替下一条命令吃掉它的应答。
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            raw = self.ser.readline()
+            if not raw:
+                continue
+            line = raw.decode("utf-8", errors="replace").strip()
+            if line and self.echo is not None:
+                self.echo.rx("GX28", line)
+            if "已紧急停止" in line:
+                return
+
     def stop(self) -> None:
-        """急停（若滑台正在运动）。"""
+        """急停（若滑台正在运动）。
+
+        写完 `q` 必须把回执读掉再返回。固件回的那行留在缓冲区里，会被**下一条**命令
+        的 `_read_until` 当成自己的回执读到——于是「关闭 a 阀」被记成失败，故障报告
+        变成「安全状态未确认」，而固件的 emergencyStop() 其实已经把两个阀都关了。
+        是程序没法确认安全，不是机器不安全。
+
+        急停路径本身绝不能再抛异常：读不到就到此为止，`_stopped` 已经置起了。
+        """
         self._stopped = True
         self.zero_confirmed = False
-        if self.ser is not None:
+        if self.ser is None:
+            return
+        try:
             self.ser.write(b"q\n")
+            self._read_stop_ack()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------- 枚举与解析

@@ -48,7 +48,7 @@ def _read_toml(path: Path) -> dict:
         with path.open("rb") as stream:
             return tomllib.load(stream)
     except OSError as exc:
-        raise ValueError(f"configuration: cannot read {path}: {exc}") from exc
+        raise ValueError(f"配置：无法读取 {path}：{exc}") from exc
 
 
 def _merge(base: dict, overlay: dict, path: Path) -> dict:
@@ -61,11 +61,11 @@ def _merge(base: dict, overlay: dict, path: Path) -> dict:
               for section, values in base.items()}
     for section, values in overlay.items():
         if not isinstance(values, dict):
-            raise ValueError(f"configuration: {path} 的 {section} 不是配置段")
+            raise ValueError(f"配置：{path} 的 {section} 不是配置段")
         for key, value in values.items():
             if isinstance(value, dict):
                 raise ValueError(
-                    f"configuration: {path} 不支持嵌套表 [{section}.{key}]")
+                    f"配置：{path} 不支持嵌套表 [{section}.{key}]")
         merged.setdefault(section, {}).update(values)
     return merged
 
@@ -75,7 +75,7 @@ def dumps(values: Mapping[str, Mapping[str, object]]) -> str:
     lines: list[str] = []
     for section, entries in values.items():
         if not isinstance(entries, Mapping):
-            raise ValueError(f"cannot write non-table section {section}")
+            raise ValueError(f"无法写出非配置段 {section}")
         if lines:
             lines.append("")
         lines.append(f"[{_format_key(section)}]")
@@ -101,11 +101,11 @@ def _format_value(section: str, key: str, value: object) -> str:
         return repr(value)
     if isinstance(value, float):
         if not math.isfinite(value):
-            raise ValueError(f"cannot write non-finite value for [{section}] {key}")
+            raise ValueError(f"[{section}] {key} 不是有限数，无法写出")
         return repr(value)
     if isinstance(value, str):
         return _quote(value)
-    raise ValueError(f"cannot write {type(value).__name__} for [{section}] {key}")
+    raise ValueError(f"[{section}] {key} 的类型 {type(value).__name__} 无法写出")
 
 
 def write_local(path: Path, values: Mapping[str, Mapping[str, object]]) -> None:

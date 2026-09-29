@@ -15,44 +15,70 @@ from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
-FIELDS = ("index", "cnc_x_mm", "cnc_y_mm", "needle_hits", "status", "duration_s", "error")
+FIELDS = ("row", "index", "cnc_x_mm", "cnc_y_mm", "needle_hits", "status", "duration_s", "error")
 
 
 class RunReporter:
     def __init__(self, *, job, plan, machine, motion, scan_z_mm: float, out_dir: Path,
-                 stamp: datetime | None = None):
+                 datum: tuple[float, float] | None = None, stamp: datetime | None = None):
         self.job, self.plan, self.machine, self.motion = job, plan, machine, motion
         self.scan_z_mm = scan_z_mm
+        self.datum = datum
         self.errors: list[str] = []
         self.out_dir = Path(out_dir)
         self.stamp = stamp or datetime.now()
-        self.csv_path = self.out_dir / f"run-{self.stamp:%Y%m%d-%H%M%S}.csv"
-        self.json_path = self.out_dir / f"run-{self.stamp:%Y%m%d-%H%M%S}.json"
+        # 文件名精确到秒，同一秒起两次就会同名。这里先把默认名摆着，真正开文件时再用
+        # 独占创建撞开（见 _open_unique_csv）。stamp 本身不动——它同时是摘要里的
+        # started_at，改了就成伪造开始时间了。
+        base = f"run-{self.stamp:%Y%m%d-%H%M%S}"
+        self.csv_path = self.out_dir / f"{base}.csv"
+        self.json_path = self.out_dir / f"{base}.json"
         self._stream = None
         self._writer = None
-        self._started: dict[int, float] = {}
+        # 每排的 index 都从 0 重新数，所以键必须是 (row, index) 才不串排。
+        self._started: dict[tuple[int, int], float] = {}
         self._artifacts: tuple[Path, Path] | None = None
         try:
             self.out_dir.mkdir(parents=True, exist_ok=True)
-            self._stream = self.csv_path.open("w", newline="", encoding="utf-8-sig")
-            self._writer = csv.DictWriter(self._stream, fieldnames=FIELDS)
-            self._writer.writeheader()
-            self._stream.flush()
+            self._open_unique_csv(base)
         except OSError as exc:
             self._fail(f"结果文件不可写，本次运行不记录：{exc}")
 
-    # ---- coordinator 进度回调 ----
-    def placement_started(self, index: int, total: int, placement) -> None:
-        self._started[index] = time.monotonic()
+    def _open_unique_csv(self, base: str) -> None:
+        """独占新建 CSV；同秒撞名就顺延 -2、-3……
 
-    def placement_finished(self, index: int, total: int, placement, *,
+        用 "x" 而不是「先 exists() 再 "w"」：后者两步之间有个窗口，同一秒真的起两次
+        运行时两边会一起选中同一个名字，后开的把先开的截断——先那份记录就没了。
+        "x" 由操作系统保证原子，撞上就换下一个。
+        """
+        for index in range(1, 1000):
+            stem = base if index == 1 else f"{base}-{index}"
+            path = self.out_dir / f"{stem}.csv"
+            try:
+                self._stream = path.open("x", newline="", encoding="utf-8-sig")
+            except FileExistsError:
+                continue
+            self.csv_path = path
+            self.json_path = self.out_dir / f"{stem}.json"
+            self._writer = csv.DictWriter(self._stream, fieldnames=FIELDS)
+            self._writer.writeheader()
+            self._stream.flush()
+            return
+        raise OSError(f"同一秒内已有 999 份结果文件，无法为本次运行分配文件名：{base}")
+
+    # ---- coordinator 进度回调 ----
+    def placement_started(self, row: int, index: int, total: int, placement) -> None:
+        self._started[(row, index)] = time.monotonic()
+
+    def placement_finished(self, row: int, index: int, total: int, placement, *,
                            ok: bool, error: str | None) -> None:
         if self._writer is None:
             return
-        started = self._started.pop(index, None)
+        started = self._started.pop((row, index), None)
         duration = "" if started is None else f"{time.monotonic() - started:.3f}"
         try:
             self._writer.writerow({
+                "row": row + 1,
                 "index": index + 1,
                 "cnc_x_mm": f"{placement.cnc_x_mm:.4f}",
                 "cnc_y_mm": f"{placement.cnc_y_mm:.4f}",
@@ -87,16 +113,19 @@ class RunReporter:
         summary = {
             "state": result.state.name,
             "completed_placements": result.completed_placements,
-            "total_placements": result.total_placements,
+            "placements_per_row": result.placements_per_row,
+            "completed_rows": result.completed_rows,
             "error": result.error,
             "started_at": self.stamp.isoformat(),
             "finished_at": datetime.now().isoformat(),
             "scan_z_mm": self.scan_z_mm,
+            "z_datum": list(self.datum) if self.datum is not None else None,
             "job": asdict(self.job),
             "machine": asdict(self.machine),
             "motion": asdict(self.motion),
             "plan": {"needle_pitch_mm": self.plan.needle_pitch_mm,
                      "servo_target_mm": self.plan.servo_target_mm,
+                     "slope": self.plan.slope,
                      "placement_count": len(self.plan.placements)},
             "csv": self.csv_path.name,
             "warnings": list(warnings),

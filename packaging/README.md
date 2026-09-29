@@ -30,8 +30,8 @@ cd dist\ZpinControl
 .\ZpinControl.exe --smoke-test
 ```
 
-期望输出 `COMPLETE: 1620/1620 placements` 和 `valves closed`，退出码 0。这条命令
-不读配置、不开任何设备。
+期望输出 `已完成：18 个落点，共 3 排（每排 6 个）` 和 `阀门已关闭`，退出码 0。
+这条命令不读配置、不开任何设备。
 
 ## 产物结构
 
@@ -91,8 +91,12 @@ pyserial 已经打进包里了，CH340 串口驱动（GX28 滑台和 CNC 三维�
 菜单里把 `[4]` 打开，或者命令行加 `--debug`：
 
 ```
-ZpinControl.exe --live --confirm-datum --debug
+ZpinControl.exe --live --confirm-datum --datum-x 0 --datum-z -5 --debug
 ```
+
+`--datum-x` / `--datum-z` 是对刀点，**每次装夹都要重新量**，上面的数值只是占位。
+非交互路径必须显式给出，少一个就会在连接设备之前报错退出——不带 `--confirm-datum`
+走向导时不用填，向导会让你对刀两次把坐标读回去。
 
 打开后，设备自己说的每一行都原样打到终端，出错时**固件原话先出现，主控的转述
 随后**：
@@ -120,8 +124,8 @@ CNC 每次移动都会每 0.1 秒发一次 `?` 查询状态，一秒 10 行一�
 
 ```
 ZpinControl.exe --smoke-test                          # 参考作业全流程，不接硬件
-ZpinControl.exe --simulate --width 120                # 指定作业仿真
-ZpinControl.exe --live --confirm-datum --debug        # 实机
+ZpinControl.exe --simulate --angle -30 --length 20 --spacing 2 --depth 3   # 指定作业仿真
+ZpinControl.exe --live --confirm-datum --datum-x 0 --datum-z -5 --debug    # 实机
 ```
 
 `--smoke-test` / `--simulate` / `--live` 三者互斥。在**非终端**环境（管道、重定向、
