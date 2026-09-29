@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import math
 import queue
-import secrets
 import sys
 import threading
 from dataclasses import dataclass
@@ -182,7 +181,7 @@ def _read_stop_commands(commands: queue.Queue[str], *, echo=None,
     自己退出。加这道闸是为了让它在运行**结束后**读到的那一行不被当成指令：否则操作员
     敲给下一个提示（菜单、下一次运行）的那一下会被这个线程吃掉。
     """
-    prompt = "运行中，输入 ! 急停 > "
+    prompt = "运行中，回车确认下一步，输入 ! 急停 > "
     while True:
         try:
             if echo is not None:
@@ -288,30 +287,29 @@ class RowTurnGate:
     """排间确认：一排跑完后等操作员剪丝并把管子转过一个周向位置。
 
     机器没有回转轴，所以程序既不校验也不提示转了多少度——只等人按确认。
-    与 `OperatorGate` 同一套令牌握手，只是文案不同；主循环按当前等待方分派。
+    与 `OperatorGate` 同一套回车确认机制，只是文案不同；主循环按当前等待方分派。
     """
 
     def __init__(self, *, output=None):
         self.output = output if output is not None else sys.stdout
         self._lock = threading.Lock()
         self._ready = threading.Event()
-        self._token: str | None = None
+        self._waiting = False
         self._answer = False
 
     @property
-    def waiting_token(self) -> str | None:
+    def waiting(self) -> bool:
         with self._lock:
-            return self._token
+            return self._waiting
 
     def wait_for_turn(self, completed_rows: int, cancel: threading.Event) -> bool:
-        token = secrets.token_hex(3).upper()
         with self._lock:
             self._ready.clear()
-            self._token = token
+            self._waiting = True
             self._answer = False
         print(f"第 {completed_rows} 排已完成：滑台已抬到安全高度并回到排头。"
-              f"请剪断五根丝、把管子转过一个周向位置，确认后输入 READY {token} "
-              f"再跑一模一样的一排；不再跑下一排请输入 DONE；输入 ! 停止。",
+              "请剪断五根丝、把管子转过一个周向位置，确认后按回车继续下一排；"
+              "不再跑下一排请输入 D；输入 ! 停止。",
               file=self.output, flush=True)
         try:
             while not cancel.is_set():
@@ -320,12 +318,12 @@ class RowTurnGate:
             return False
         finally:
             with self._lock:
-                self._token = None
+                self._waiting = False
                 self._ready.clear()
 
     def submit(self, command: str) -> bool:
         with self._lock:
-            if self._token is None or command.strip().upper() != f"READY {self._token}":
+            if not self._waiting or command.strip():
                 return False
             self._answer = True
             self._ready.set()
@@ -334,7 +332,7 @@ class RowTurnGate:
     def decline(self, command: str) -> bool:
         """DONE 是正常收工，不是急停——否则操作员会学会习惯性按 !，那才是危险。"""
         with self._lock:
-            if self._token is None or command.strip().upper() not in ("DONE", "完成"):
+            if not self._waiting or command.strip().upper() not in ("D", "DONE", "完成"):
                 return False
             self._answer = False
             self._ready.set()
@@ -475,9 +473,9 @@ def _execute_live_job(cfg: dict, row: RowSpec, motion: HeadMotion, scan_z: float
             return False
         return turn_gate.wait_for_turn(completed_rows, cancel)
 
-    print("实时运行：输入 ! 可请求三路停止。每次五针退回且 B 阀排气后，"
-          "请剪丝并按屏幕提示输入 READY 代码，才会移动到下一落点。"
-          "一排跑完后滑台抬到安全高度并回到排头，等人工剪丝转管后确认再跑下一排。")
+    print("实时运行：每次五针退回且 B 阀排气后，请剪丝并按回车移动到下一落点；"
+          "一排跑完后滑台抬到安全高度并回到排头，剪丝转管后按回车继续下一排；"
+          "输入 D 正常收工，输入 ! 请求三路停止。")
     commands: queue.Queue[str] = queue.Queue()
     stop_reading = threading.Event()
     reader = threading.Thread(target=_read_stop_commands, args=(commands,),
@@ -500,9 +498,11 @@ def _execute_live_job(cfg: dict, row: RowSpec, motion: HeadMotion, scan_z: float
                 coordinator.request_stop()
             elif turn_gate.decline(command):
                 print("不再跑下一排，本次作业正常收工。")
-            elif (command.upper().startswith("READY")
-                  and not (gate.submit(command) or turn_gate.submit(command))):
-                print("确认码无效或当前未等待剪丝；下一落点仍未放行。")
+            elif command.strip() == "":
+                if not (gate.submit(command) or turn_gate.submit(command)):
+                    print("当前没有等待中的人工确认。")
+            else:
+                print("当前需要按回车继续；输入 D 可在排间正常收工，! 可停止。")
         except queue.Empty:
             pass
         except KeyboardInterrupt:

@@ -386,10 +386,9 @@ def confirm_assertions(w: Wizard) -> None:
     w.say("2. 滑台可用下行窗口已在实机测过；本次滑台行程由 depth/cosθ 推导（见排程回显）。")
     w.say("3. 上阀 B 退针后释放、切丝与供丝流程已确认。")
     while True:
-        if w.ask("确认以上三项都已在实机核实，请输入 CONFIRM").upper() == "CONFIRM":
+        if not w.ask("确认以上三项都已在实机核实，请按回车继续"):
             return
-        w.warn("未确认，无法写入 firmware_verified / datum_confirmed / "
-               "upper_release_after_retract。")
+        w.warn("请按回车确认；输入 Q 可取消本次设置。")
 
 
 # ------------------------------------------------------------------ 编排
