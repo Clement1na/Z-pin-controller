@@ -105,6 +105,26 @@ class Coordinator:
         if abs(self.head.position_mm() - self.motion.standby_mm) > 0.05:
             raise RuntimeError("滑台不在已确认的 standby_mm 待机位")
 
+    def _check_single_ready(self) -> None:
+        """Validate the two devices needed by the manual one-shot action.
+
+        A one-shot injection deliberately leaves the CNC where the operator put
+        it.  Reusing ``_check_ready`` here would make the diagnostic action
+        depend on a CNC Z datum and would invite an unexpected CNC move, so the
+        The CNC object is still carried by the coordinator for the common
+        emergency-stop path, but it is not queried or moved here.
+        """
+        for name, device in (("SV630N 伺服", self.servo),
+                             ("GX28 滑台", self.head)):
+            if not device.connected:
+                raise RuntimeError(f"{name} 未连接")
+        if self.servo.origin_count is None:
+            raise RuntimeError("伺服逻辑零位必须先设置")
+        if not self.head.zero_confirmed:
+            raise RuntimeError("滑台软件零位必须先设置")
+        if abs(self.head.position_mm() - self.motion.standby_mm) > 0.05:
+            raise RuntimeError("单次注入前滑台必须位于 standby_mm 待机位")
+
     def request_stop(self) -> None:
         """Callable from another thread while a device method is waiting."""
         with self._stop_lock:
@@ -234,4 +254,41 @@ class Coordinator:
             self.request_stop()
             self.state = RunState.FAULT
             return RunResult(self.state, self._completed, total, completed_rows,
+                             self._stop_reason(str(exc)))
+
+    def run_single(self, plan: RowPlan) -> RunResult:
+        """Perform exactly one five-needle cycle at the CNC's current position.
+
+        This is the manual/debug path.  It uses the selected plan only for the
+        servo expansion target and the head stroke; it never calls ``cnc.move_to``
+        and does not require a CNC work datum.
+        """
+        if self.state is not RunState.READY:
+            raise RuntimeError("总控不能重复运行，也不能在停止后恢复")
+        if not plan.placements:
+            raise ValueError("单次注入需要至少一个排程落点")
+        self._check_single_ready()
+        self._completed = 0
+        self.state = RunState.RUNNING
+        try:
+            self._check_cancel()
+            self.servo.move_mm(plan.servo_target_mm)
+            self._check_cancel()
+            self._cycle_one()
+            self._completed = 1
+            self.state = RunState.COMPLETE
+            return RunResult(self.state, 1, 1, 1)
+        except _StopRequested:
+            self.request_stop()
+            self.state = RunState.STOPPED
+            return RunResult(self.state, self._completed, 1, 0,
+                             self._stop_reason("操作员请求停止"))
+        except Exception as exc:
+            if self.cancel_event.is_set():
+                self.state = RunState.STOPPED
+                return RunResult(self.state, self._completed, 1, 0,
+                                 self._stop_reason("操作员请求停止"))
+            self.request_stop()
+            self.state = RunState.FAULT
+            return RunResult(self.state, self._completed, 1, 0,
                              self._stop_reason(str(exc)))

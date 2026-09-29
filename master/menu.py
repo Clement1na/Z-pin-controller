@@ -36,6 +36,7 @@ def run_startup_menu(*, config_path, results_dir=None, debug=False, menu=None,
     这类脚本化调用不受影响，否则自动化会挂在那里等输入。
     """
     from master.master import SMOKE_JOB, SMOKE_ROWS, _known_geometry, run_simulation
+    from master.manual import run_manual_menu
     from master.model import RowSpec
     from master.profile_ui import run_profile_manager
     from master.profiles import ProfileStore
@@ -93,8 +94,7 @@ def run_startup_menu(*, config_path, results_dir=None, debug=False, menu=None,
             code = simulate_fn(RowSpec(**SMOKE_JOB), rows=SMOKE_ROWS)
         else:
             if manual_fn is None:
-                menu.warn("组件手动控制尚未接入。")
-                continue
+                manual_fn = run_manual_menu
             code = manual_fn(store=store, selection=selection,
                              config_path=Path(config_path), debug=debug_on)
         _hold_before_exit(menu)

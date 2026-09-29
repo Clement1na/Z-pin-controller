@@ -408,10 +408,9 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
     geometry = cli._known_geometry()
     cfg = load_merged(config_path)
     if profile_store is not None and profile_selection:
-        machine = profile_selection.get("machine")
-        job = profile_selection.get("job")
-        if machine and job:
-            cfg = profile_store.compose(config_path, machine=machine, job=job)
+        cfg = profile_store.compose(config_path,
+                                    machine=profile_selection.get("machine"),
+                                    job=profile_selection.get("job"))
     devices = None
     try:
         env = collect_environment(w, cfg, find_adapters=find_adapters,

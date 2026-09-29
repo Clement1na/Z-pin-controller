@@ -156,8 +156,11 @@ class ProfileStore:
             os.fsync(stream.fileno())
         os.replace(tmp, self.selection_path)
 
-    def compose(self, template: Path, *, machine: str, job: str) -> dict:
+    def compose(self, template: Path, *, machine: str | None = None,
+                job: str | None = None) -> dict:
         base = load_merged(Path(template))
-        return _overlay(_overlay(base, self.load("machines", machine)),
-                        self.load("jobs", job))
-
+        if machine:
+            base = _overlay(base, self.load("machines", machine))
+        if job:
+            base = _overlay(base, self.load("jobs", job))
+        return base
