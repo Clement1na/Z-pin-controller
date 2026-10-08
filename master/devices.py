@@ -386,7 +386,7 @@ class InsertHead:
             self._read_until(("ZPIN_HEAD_PROTOCOL=2",), 3.0)
         except Exception as exc:
             self.close()
-            raise RuntimeError("滑台固件必须支持协议 2；请烧录并核对本仓库当前固件") from exc
+            raise RuntimeError(f"GX28 滑台 {self.port} 协议 2 握手失败：{exc}") from exc
 
     def close(self) -> None:
         self.zero_confirmed = False
@@ -418,6 +418,19 @@ class InsertHead:
                 if self.echo is not None:
                     # 固件原话先落地，主控的转述随后——出错时也得看得见设备说了什么。
                     self.echo.rx("GX28", line)
+                if "ZPIN_HEAD_PROTOCOL=2" in keywords:
+                    if "invalid header:" in line.lower():
+                        raise RuntimeError(
+                            f"ESP32 启动异常（{line}），固件尚未运行；"
+                            "与已知 GPIO12/Flash 供电问题现象一致。"
+                            "请将 USB 与 Shield/驱动电源完全断开后冷启动，勿按 RESET；"
+                            "该回话不能证明固件需要重烧")
+                    if line.lower().startswith(("grbl", "error:", "alarm:")):
+                        raise RuntimeError(
+                            f"收到 CNC/GRBL 风格回话 {line!r}；"
+                            "请核对滑台串口是否误选为 CNC 串口")
+                    if line.startswith("ZPIN_HEAD_PROTOCOL=") and line != "ZPIN_HEAD_PROTOCOL=2":
+                        raise RuntimeError(f"设备报告 {line!r}，与要求的协议 2 不匹配，请核对固件版本")
                 if "已紧急停止" in line:
                     self._stopped = True
                     raise RuntimeError(f"滑台已急停，位置不可信：{line}")
