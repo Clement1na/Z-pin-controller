@@ -12,6 +12,21 @@ MAX_DEPTH_MM = 3.0
 #: Sanity bound on the fixturing angle; the process only uses 0/+/-15/+/-30.
 MAX_ANGLE_DEG = 45.0
 
+#: Axial length of the reinforced zone the preset covers. The operator's own
+#: wording for it is "20 mm", so it is a constant here rather than an input.
+PRESET_ZONE_MM = 20.0
+
+#: Minimum needle pitch -- the servo is left alone and the two loaded needles
+#: sit at the mechanical base spacing.
+PRESET_PITCH_MM = 10.0
+
+#: Only the two rightmost stations are loaded. The other three stay empty.
+PRESET_NEEDLES = 2
+
+#: Densities offered by the menu. The model itself works for any count >= 2;
+#: this tuple is only the choice list.
+PRESET_COUNTS = (7, 10, 15)
+
 
 def _positive(name: str, value: float) -> None:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
@@ -24,32 +39,34 @@ def _finite(name: str, value: float) -> None:
 
 
 @dataclass(frozen=True)
-class RowSpec:
-    """One reinforced row on a tilted tube.
+class PresetSpec:
+    """One preset row: ``count`` evenly spaced pins across a fixed 20 mm zone.
+
+    Only the two rightmost needles are loaded and they sit at the mechanical
+    base pitch of 10 mm, so the servo never moves. A stroke at axial position
+    ``u`` therefore implants at ``{u, u + 10}``. For the union of those pairs to
+    be a *uniform* grid, ``10 = pairs * spacing`` must hold; taking
+    ``pairs = count // 2`` gives ``spacing = 10 / pairs`` and the union covers
+    ``{0 .. 2*pairs-1} * spacing``. An odd ``count`` gets one extra stroke at
+    ``(count-1) * spacing`` to place the last pin.
+
+    That extra stroke's second needle lands at ``(count-1) * spacing + 10``,
+    outside the zone -- the normal overhang case, recorded and cut off later.
 
     The needles stay vertical; the tube is fixtured at ``angle_deg``. That is how
     +/-15 and +/-30 are achieved. ``angle_deg`` is **signed**: a positive angle
     means the tube surface rises towards +x, so the work height tracked by the CNC
     climbs with x. A negative angle is the mirror case and walks the work height
     back down -- the two signs are genuinely different machine situations.
-
-    ``length_mm`` is the **reinforced zone** the operator asked for, not the stock
-    length. The pins are spaced ``spacing_mm`` apart starting at 0, so the span
-    that actually carries pins is ``covered_mm`` <= ``length_mm``; see ``x_count``
-    for why the two differ. The needle pitch is chosen from the calibrated 10-20 mm
-    band, so most of the five needles land outside this span either way. That is
-    expected: the real stock is longer and the overhang is cut off afterwards.
     """
 
     angle_deg: float
-    length_mm: float
-    spacing_mm: float
+    count: int
     depth_mm: float
 
     def __post_init__(self) -> None:
         _finite("angle_deg", self.angle_deg)
-        for name in ("length_mm", "spacing_mm", "depth_mm"):
-            _positive(name, getattr(self, name))
+        _positive("depth_mm", self.depth_mm)
         if abs(self.angle_deg) > MAX_ANGLE_DEG:
             raise ValueError(f"angle_deg 必须在 ±{MAX_ANGLE_DEG:g} 度以内")
         if self.depth_mm > MAX_DEPTH_MM:
@@ -57,31 +74,52 @@ class RowSpec:
                 f"depth_mm 沿垂直管面量，不得超过 {MAX_DEPTH_MM:g} mm；"
                 f"碳管壁下方就是金属接头"
             )
-        if self.length_mm < self.spacing_mm:
-            raise ValueError(
-                f"length_mm（{self.length_mm:g}）比 spacing_mm（{self.spacing_mm:g}）"
-                f"还短，一个点都放不下"
-            )
+        if isinstance(self.count, bool) or not isinstance(self.count, int) or self.count < 2:
+            raise ValueError("count 必须是不小于 2 的整数")
+
+    @property
+    def pairs(self) -> int:
+        """Strokes that place two pins each."""
+        return self.count // 2
+
+    @property
+    def spacing_mm(self) -> float:
+        """Uniform pin spacing, ``10 / pairs``. Derived, never an input."""
+        return PRESET_PITCH_MM / self.pairs
+
+    @property
+    def length_mm(self) -> float:
+        """The reinforced zone. Fixed at 20 mm for the preset."""
+        return PRESET_ZONE_MM
 
     @property
     def x_count(self) -> int:
-        """Pin positions along the row: ``floor(length/spacing)``.
+        """Pin positions along the row. Exactly ``count`` -- never a division.
 
-        The reinforced zone is the real span the operator asked for; the pitch
-        is what the process dictates. They rarely divide evenly -- the sample
-        plan's own numbers are 20 mm at 2.75 mm (7 positions) and 20 mm at
-        1.30 mm (15 positions), neither of them exact. Rounding *up* would put
-        a pin past the zone, so the count is the number that fits, and the
-        short tail at the end of the row simply gets no pin. The wizard echoes
-        that tail so the operator can see it rather than discover it.
+        ``RowSpec`` derived this as ``floor(length/spacing)``, which can only
+        ever come out even here: ``20 / (10/3)`` is exactly ``6.0`` in double
+        precision, so the odd preset's ``2*pairs + 1`` was unreachable, and the
+        missing pin sat exactly at ``x = 20`` -- the point the half-open
+        ``[0, length)`` interval excludes. The count is the input, so it is
+        returned directly.
         """
-        return math.floor(self.length_mm / self.spacing_mm)
+        return self.count
 
     @property
     def covered_mm(self) -> float:
-        """Span actually carrying pins, ``x_count * spacing_mm``. Never more
-        than ``length_mm``; the difference is the unpinned tail."""
-        return self.x_count * self.spacing_mm
+        """Span actually carrying pins, ``(count-1) * spacing``.
+
+        Equal to 20 mm for odd counts; short of it for even ones -- ``count=10``
+        spans only 18 mm because ``spacing = 2.0`` is the sole solution of
+        ``10 = integer * spacing``. The operator already said the 20 mm end is
+        not required, so that is the expected result, not a defect.
+        """
+        return (self.count - 1) * self.spacing_mm
+
+    @property
+    def tail_mm(self) -> float:
+        """Unpinned tail at the far end of the zone, ``length - covered``."""
+        return PRESET_ZONE_MM - self.covered_mm
 
     @property
     def slope(self) -> float:
@@ -97,8 +135,11 @@ class RowSpec:
     def needle_length_step_mm(self, pitch_mm: float) -> float:
         """Arithmetic needle-length step of the needle group, ``pitch * tan(theta)``.
 
-        Physical property of the group, not a motion command: because the sign
-        follows ``angle_deg``, +15 and -15 need two different needle groups.
+        Physical property of the group, not a motion command. The two loaded
+        needles are 10 mm apart on a tilted surface, so the right one has to be
+        ``10 * tan(theta)`` longer than the left for both tips to reach the wall
+        at once. Because the sign follows ``angle_deg``, +15 and -15 need two
+        different needle groups.
         """
         _finite("pitch_mm", pitch_mm)
         if pitch_mm <= 0:

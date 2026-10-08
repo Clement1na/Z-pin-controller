@@ -12,8 +12,8 @@ import sys
 from pathlib import Path
 
 from master.devices import list_nics, list_serial_ports, rank_nics, rank_serial_ports
-from master.model import MAX_ANGLE_DEG, MAX_DEPTH_MM, HeadMotion, RowSpec
-from master.planner import highest_work_z_mm, plan_row
+from master.model import MAX_ANGLE_DEG, MAX_DEPTH_MM, PRESET_COUNTS, HeadMotion, PresetSpec
+from master.planner import highest_work_z_mm, plan_preset_row
 
 # 对应固件 insert_head.ino 的 WORK_MIN_MM，是机械行程不是工艺参数，不问操作员。
 WORK_MIN_MM = -10.0
@@ -243,53 +243,31 @@ def _ask_limit(w: Wizard, prompt: str, current) -> float:
 
 
 # ------------------------------------------------------------------ 作业
-def collect_job(w: Wizard, geometry, *, defaults=None):
-    """采集本次作业的植入参数，返回已通过排程的 (RowSpec, RowPlan)。"""
+def collect_preset(w: Wizard, geometry, *, defaults=None):
+    """Collect density, signed fixture angle and perpendicular depth each run."""
+    from master.master import _print_plan
     defaults = defaults or {}
-    w.say("=== 植入参数（每次作业都重新询问，不写入本机配置）===")
-    w.say("针始终竖直，角度靠把管子架起来实现；角度带符号，正值 = 管面朝 +x 上升。")
+    w.say("=== 预设任务：20 mm 强化区，仅装最右两针，针距固定 10 mm，伺服保持零位 ===")
+    w.say("对刀以两根已装针中左针为排头；角度正值表示管面朝 +X 上升。")
     while True:
-        angle = w.ask_float("架子角度 θ（度，带符号，例如 15 / -15 / 30）",
-                            minimum=-MAX_ANGLE_DEG, maximum=MAX_ANGLE_DEG,
-                            default=_default_text(defaults.get("angle_deg")), unit="°")
-        length = w.ask_float("一排的强化区长度 mm（不是管料长度）", minimum=MIN_DIMENSION_MM,
-                             default=_default_text(defaults.get("length_mm")))
-        spacing = w.ask_float("点距 mm", minimum=MIN_DIMENSION_MM,
-                              default=_default_text(defaults.get("spacing_mm")))
-        depth = w.ask_float(
-            f"植入深度 mm（沿垂直管面量，不超过 {MAX_DEPTH_MM:g}）",
-            minimum=MIN_DIMENSION_MM, maximum=MAX_DEPTH_MM,
-            default=_default_text(defaults.get("depth_mm")),
-            too_big=f"必须不大于 {MAX_DEPTH_MM:g} mm——碳管壁只有 2 mm，"
-                    f"再往下就是金属接头，这是碰撞不是废品")
+        count = int(w.choose("每排植入根数", tuple((str(n), f"{n} 根") for n in PRESET_COUNTS),
+                             default=str(defaults.get("count", 7)) if defaults.get("count", 7) in PRESET_COUNTS else "7"))
+        angle = w.ask_float("架子角度 θ（度，带符号）", minimum=-MAX_ANGLE_DEG,
+                            maximum=MAX_ANGLE_DEG, default=_default_text(defaults.get("angle_deg")), unit="°")
+        depth = w.ask_float(f"植入深度 mm（垂直管面，不超过 {MAX_DEPTH_MM:g}）",
+                            minimum=MIN_DIMENSION_MM, maximum=MAX_DEPTH_MM,
+                            default=_default_text(defaults.get("depth_mm")),
+                            too_big="必须不大于 3 mm——碳管壁下方就是金属接头")
         try:
-            row = RowSpec(angle, length, spacing, depth)
+            row = PresetSpec(angle, count, depth)
+            plan = plan_preset_row(row, geometry)
         except ValueError as exc:
-            w.warn(f"参数不成立：{exc}。请重新输入四个参数。")
+            w.warn(f"参数不成立：{exc}。请重新输入。")
             continue
-        try:
-            plan = plan_row(row, geometry)
-        except ValueError as exc:
-            w.warn(f"排程失败：{exc}。请重新输入四个参数。")
-            continue
-        travel = plan.placements[-1].cnc_x_mm - plan.placements[0].cnc_x_mm
-        w.say(f"排程结果：{row.x_count} 个植入点，{len(plan.placements)} 次五针动作，"
-              f"针距 {plan.needle_pitch_mm:g} mm，伺服目标 {plan.servo_target_mm:g} mm。")
-        # 强化区长度和点距通常除不尽（样件规划里 20 mm @ 2.75 / 1.30 都不是整数倍）。
-        # 排点数取能放下的那个整数，末端的余量不扎针——必须说出来，否则操作员会以为
-        # 整段都扎满了，或者自己去做一遍除法才发现少了零点几毫米。
-        tail = row.length_mm - row.covered_mm
-        if tail > 1e-9:
-            w.say(f"  强化区 {row.length_mm:g} mm，扎针覆盖 {row.covered_mm:g} mm"
-                  f"（{row.x_count} × {row.spacing_mm:g}），末端 {tail:.4g} mm 不扎针"
-                  f"（不足一个点距，放不下第 {row.x_count + 1} 个点）。")
-        else:
-            w.say(f"  强化区 {row.length_mm:g} mm，扎针覆盖 {row.covered_mm:g} mm，正好铺满。")
-        # 角度的符号是针组的身份：+15 和 -15 的针长等差步长反号，物理上是两套针。
-        w.say(f"滑台行程 {row.slide_travel_mm:.4g} mm（= 深度/cosθ）；"
-              f"针长等差步长 {row.needle_length_step_mm(plan.needle_pitch_mm):+.4g} mm"
-              f"（这套针组只配 {angle:+g}° 这个符号）；"
-              f"排内 Z 变化 {row.slope * travel:+.3f} mm。")
+        # Keep terminal and GUI logs on their respective output sink.
+        _print_plan(row, plan, emit=w.say)
+        w.say("动作 X：" + ", ".join(f"{p.cnc_x_mm:.4g}" for p in plan.placements) + " mm")
+        w.say("区内落点：" + ", ".join(f"{i * row.spacing_mm:.4g}" for i in range(row.count)) + " mm")
         return row, plan
 
 
@@ -367,7 +345,8 @@ def wait_for_safe_height(w: Wizard, cnc, datum, plan) -> float:
 def check_limits(plan, limits) -> None:
     """排程落点是否落在 CNC 软限位内；不满足则抛 ValueError。"""
     x_max, y_max, _ = limits
-    reach_x = max(placement.cnc_x_mm for placement in plan.placements)
+    reach_x = max(max(placement.cnc_x_mm, *(hit[0] for hit in placement.needle_hits))
+                  for placement in plan.placements)
     reach_y = max(placement.cnc_y_mm for placement in plan.placements)
     if reach_x > x_max or reach_y > y_max:
         raise ValueError(f"排程需要 X≥{reach_x:g}、Y≥{reach_y:g} mm，"
@@ -395,8 +374,13 @@ def confirm_assertions(w: Wizard) -> None:
 def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapters=None,
                      list_ports=None, results_dir=None, input_fn=None,
                      output=None, debug=False, profile_store=None,
-                     profile_selection=None) -> int:
-    """交互式实机流程：环境 → 作业 → 连接 → 零点 → 对刀 → 确认 → 运行。"""
+                     profile_selection=None, menu=None, command_reader=None, job_source=None) -> int:
+    """交互式实机流程：环境 → 作业 → 连接 → 零点 → 对刀 → 确认 → 运行。
+
+    `menu` 与 `command_reader` 是给图形界面的两个注入点：安全设置菜单和急停指令
+    在这里各有一次**绕过 `wizard` 参数**的直接调用（下面 `_prepare_live_zeros` 与
+    `_execute_live_job` 两处），留空即原来的终端行为。
+    """
     from master import master as cli
     from master.local_config import load_merged, local_path_for, write_local
 
@@ -406,20 +390,23 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
     w = Wizard(input_fn=input_fn, output=output) if wizard is None else wizard
     local_path = local_path_for(config_path)
     geometry = cli._known_geometry()
+    source = job_source or cli.PresetJobSource()
     cfg = load_merged(config_path)
     if profile_store is not None and profile_selection:
         cfg = profile_store.compose(config_path,
                                     machine=profile_selection.get("machine"),
-                                    job=profile_selection.get("job"))
+                                    custom=profile_selection.get("custom"))
     devices = None
     try:
         env = collect_environment(w, cfg, find_adapters=find_adapters,
                                   list_ports=list_ports)
-        row, plan = collect_job(w, geometry, defaults=cfg.get("job", {}))
+        row, _ = collect_preset(w, geometry, defaults={**cfg.get("job", {}), **(job_overrides or {})})
+        row = source.build(cfg, {**preset_values(row), **(job_overrides or {})})
+        plan = source.plan(row, geometry)
         env = _reconcile_limits(w, env, plan)
         motion = _build_motion(row)
         # 先落盘一次：即使后面在零点或对刀处中止，操作员选的端口/网卡也留下来了。
-        write_local(local_path, _local_sections(env, motion))
+        write_local(local_path, {**_local_sections(env, motion), "job": preset_values(row)})
         w.say(f"已写入 {local_path}（此时还没有 scan_z_mm）")
 
         _apply(cfg, env)
@@ -429,28 +416,28 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
         cli._connect_live_devices(devices)
         w.say(f"连接后状态：CNC WPos={devices.cnc.position()}，"
               f"滑台软件读数={devices.head.position_mm():.3f} mm。")
-        if not confirm_zero_state(w, devices.servo, devices.head, cli._prepare_live_zeros):
+        if not confirm_zero_state(w, devices.servo, devices.head,
+                                  lambda servo, head: cli._prepare_live_zeros(
+                                      servo, head, menu=menu)):
             w.warn("未完成零点确认，未开始自动植入。")
             return 1
         datum = wait_for_work_datum(w, devices.cnc)
         scan_z = wait_for_safe_height(w, devices.cnc, datum, plan)
         confirm_assertions(w)
-        write_local(local_path, _local_sections(env, motion, scan_z))
+        write_local(local_path, {**_local_sections(env, motion, scan_z), "job": preset_values(row)})
         w.say(f"已写入 {local_path}（含 scan_z_mm={scan_z:g} mm）")
         if profile_store is not None and profile_selection:
             machine = profile_selection.get("machine")
-            job = profile_selection.get("job")
-            if machine and job:
+            if machine:
                 profile_store.save("machines", machine,
-                                   _local_sections(env, motion, scan_z))
-                profile_store.save("jobs", job, {"job": job_values(row)})
-                w.say(f"已同步保存机器配置 {machine} 和作业方案 {job}。")
+                                   {**_local_sections(env, motion, scan_z), "job": preset_values(row)})
+                w.say(f"已同步保存机器配置 {machine}。")
 
         # 用写出的文件重新校验一遍：写出器的 bug 必须在这里暴露，而不是在运动中途。
         cfg2, row2, _, motion2, scan_z2, plan2, datum2 = cli._read_live_configuration(
-            config_path, True, {**job_values(row), **(job_overrides or {})}, datum=datum)
+            config_path, True, preset_values(row), datum=datum, job_source=source)
         _check_consistency(cfg, cfg2)
-        w.say(f"最终参数：{row2.x_count} 个植入点，{len(plan2.placements)} 次五针动作，"
+        w.say(f"最终参数：{row2.x_count} 个植入点，{len(plan2.placements)} 次扎针动作（每次两针），"
               f"针距 {plan2.needle_pitch_mm:g} mm 伺服 {plan2.servo_target_mm:g} mm，"
               f"对刀点 X={datum2[0]:g} Z={datum2[1]:g} mm，安全高度 Z={scan_z2:g} mm。")
         if not w.ask_yes_no("开始自动植入？", default=True):
@@ -459,7 +446,7 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
         return cli._execute_live_job(cfg2, row2, motion2, scan_z2, plan2, devices,
                                      datum=datum2,
                                      results_dir=_results_dir(config_path, results_dir),
-                                     echo=echo)
+                                     echo=echo, command_reader=command_reader)
     except WizardCancelled as exc:
         w.warn(f"已取消（{exc}），未开始自动植入。")
         return 1
@@ -487,7 +474,7 @@ def _reconcile_limits(w: Wizard, env: dict, plan) -> dict:
             limits = (x_max, y_max, limits[2])
 
 
-def _build_motion(row: RowSpec) -> HeadMotion:
+def _build_motion(row: PresetSpec) -> HeadMotion:
     """下行目标由深度推导：深度沿垂直管面量，滑台竖直行程 = depth/cosθ。"""
     return HeadMotion(standby_mm=0.0, insertion_mm=-row.slide_travel_mm,
                       work_min_mm=WORK_MIN_MM, work_max_mm=0.0, datum_confirmed=True)
@@ -515,9 +502,8 @@ def _local_sections(env: dict, motion: HeadMotion, scan_z_mm: float | None = Non
     }
 
 
-def job_values(row: RowSpec) -> dict:
-    return {"angle_deg": row.angle_deg, "length_mm": row.length_mm,
-            "spacing_mm": row.spacing_mm, "depth_mm": row.depth_mm}
+def preset_values(row: PresetSpec) -> dict:
+    return {"angle_deg": row.angle_deg, "count": row.count, "depth_mm": row.depth_mm}
 
 
 def _check_consistency(cfg_built: dict, cfg_validated: dict) -> None:

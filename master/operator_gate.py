@@ -24,8 +24,8 @@ class OperatorGate:
         with self._lock:
             self._ready.clear()
             self._waiting = True
-        print(f"已完成 {completed}/{total} 次五针植入，GX28 已回待机点且上气阀 B 已排气。"
-              "请人工剪断五根丝并准备下一次植入；确认安全后按回车继续。"
+        print(f"已完成 {completed}/{total} 次植入动作，GX28 已回待机点且上气阀 B 已排气。"
+              "请人工剪断已装金属丝并准备下一次植入；确认安全后按回车继续。"
               "输入 ! 可停止。", file=self.output, flush=True)
         try:
             while not cancel.is_set():

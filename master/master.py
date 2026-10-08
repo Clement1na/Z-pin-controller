@@ -15,9 +15,9 @@ sys.path.insert(0, str(ROOT))
 
 from master.coordinator import Coordinator, RunState
 from master.local_config import load_merged, local_path_for, write_local
-from master.model import HeadMotion, MachineGeometry, RowSpec
+from master.model import HeadMotion, MachineGeometry, PresetSpec
 from master.operator_gate import OperatorGate
-from master.planner import highest_work_z_mm, plan_row, work_z_mm
+from master.planner import highest_work_z_mm, plan_preset_row, work_z_mm
 from master.simulated import SimulationRig
 
 
@@ -27,13 +27,30 @@ def default_config_path() -> Path:
     return Path(__file__).resolve().parent / "config.toml"
 
 
-JOB_KEYS = ("angle_deg", "length_mm", "spacing_mm", "depth_mm")
+JOB_KEYS = ("angle_deg", "count", "depth_mm")
 
 # --smoke-test 的新基准：0.2% 密度的一排，重复三遍，好让打包验收真的走到排循环。
-SMOKE_JOB = {"angle_deg": 15.0, "length_mm": 20.0, "spacing_mm": 2.0, "depth_mm": 2.0}
+SMOKE_JOB = {"angle_deg": 15.0, "count": 7, "depth_mm": 2.0}
 SMOKE_ROWS = 3
 SMOKE_DATUM = (0.0, -5.0)
 SMOKE_SCAN_Z_MM = 0.0
+
+
+class PresetJobSource:
+    """Shared construction and planning for collection and final live preflight."""
+
+    def build(self, cfg, overrides):
+        unknown = set(overrides) - set(JOB_KEYS)
+        if unknown:
+            raise ValueError(f"配置：未知的作业覆盖项 {', '.join(sorted(unknown))}")
+        values = {key: overrides.get(key, cfg.get("job", {}).get(key)) for key in JOB_KEYS}
+        for key, value in values.items():
+            if value is None or value == "":
+                raise ValueError(f"配置：[job] {key} 必填")
+        return PresetSpec(**values)
+
+    def plan(self, job, machine):
+        return plan_preset_row(job, machine)
 
 
 def _known_geometry() -> MachineGeometry:
@@ -41,21 +58,26 @@ def _known_geometry() -> MachineGeometry:
                            max_expansion_mm=10, servo_lead_mm=13.3333333)
 
 
-def _print_plan(row: RowSpec, plan, *, datum=None, scan_z_mm: float | None = None) -> None:
+def _print_plan(row: PresetSpec, plan, *, datum=None, scan_z_mm: float | None = None, emit=print) -> None:
     step = row.needle_length_step_mm(plan.needle_pitch_mm)
-    print(f"作业：架角 {row.angle_deg:+g}°，强化区 {row.length_mm:g} mm，"
+    emit(f"作业：架角 {row.angle_deg:+g}°，强化区 {row.length_mm:g} mm，"
           f"点距 {row.spacing_mm:g} mm，深度 {row.depth_mm:g} mm")
-    print(f"排程：每排 {row.x_count} 个植入点，{len(plan.placements)} 次五针动作，"
+    emit(f"排程：每排 {row.x_count} 个植入点，{len(plan.placements)} 次扎针动作（每次两针），"
           f"针距 {plan.needle_pitch_mm:g} mm，伺服目标 {plan.servo_target_mm:g} mm")
-    print(f"滑台行程 {row.slide_travel_mm:.4g} mm；"
-          f"针长等差步长 {step:+.4g} mm（这套针组只配 {row.angle_deg:+g}° 这个符号）")
+    emit(f"滑台行程 {row.slide_travel_mm:.4g} mm；"
+          f"针长等差步长 {step:+.4g} mm（两针之间，这套针组只配 {row.angle_deg:+g}° 这个符号）")
+    emit(f"区内覆盖 {row.covered_mm:g} mm，末端余量 {row.tail_mm:.4g} mm。")
+    if row.count == 10:
+        emit("20 mm 处不要求，第 10 根在 18 mm。")
+    if row.count % 2:
+        emit("补针时另一根针落在区外 30 mm；请确认余料可容纳，之后人工切除。")
     if datum is not None:
         head = plan.placements[0].cnc_x_mm
         tail = plan.placements[-1].cnc_x_mm
         # 最高点在排尾还是排头由 θ 的符号决定，而它决定排间抬刀会不会扎进管子，
         # 所以必须说出来，不能让操作员自己从两个数里推。
         side = "排尾" if row.slope >= 0 else "排头"
-        print(f"排内工作 Z：排头 {work_z_mm(plan, head, datum):+.3f} -> "
+        emit(f"排内工作 Z：排头 {work_z_mm(plan, head, datum):+.3f} -> "
               f"排尾 {work_z_mm(plan, tail, datum):+.3f} mm"
               f"（最高 {highest_work_z_mm(plan, datum):+.3f} mm，在{side}）")
 
@@ -73,9 +95,10 @@ def _result_line(result) -> str:
             + (f"；{result.error}" if result.error else ""))
 
 
-def run_simulation(row: RowSpec, *, inject_failure: bool = False, rows: int = 1,
-                   datum=SMOKE_DATUM, scan_z_mm: float = SMOKE_SCAN_Z_MM) -> int:
-    plan = plan_row(row, _known_geometry())
+def run_simulation(row: PresetSpec, *, inject_failure: bool = False, rows: int = 1,
+                   datum=SMOKE_DATUM, scan_z_mm: float = SMOKE_SCAN_Z_MM, plan=None) -> int:
+    if plan is None:
+        plan = plan_preset_row(row, _known_geometry())
     motion = HeadMotion(standby_mm=0, insertion_mm=-row.slide_travel_mm,
                         work_min_mm=-10, work_max_mm=0, datum_confirmed=True)
     rig = SimulationRig(standby_mm=motion.standby_mm, scan_z_mm=scan_z_mm,
@@ -105,7 +128,7 @@ def run_simulation(row: RowSpec, *, inject_failure: bool = False, rows: int = 1,
 
 def _read_live_configuration(path: Path, confirmed: bool,
                              job_overrides: dict[str, float] | None = None, *,
-                             datum: tuple[float, float] | None = None):
+                             datum: tuple[float, float] | None = None, job_source=None):
     if not confirmed:
         raise ValueError("配置：实机模式必须给出 --confirm-datum")
     # 模板 + 同级的 config.local.toml（向导生成）。本机文件不存在时完全等价于只读模板。
@@ -117,14 +140,8 @@ def _read_live_configuration(path: Path, confirmed: bool,
             raise ValueError(f"配置：[{section}] {key} 必填")
         return value
 
-    overrides = job_overrides or {}
-    unknown = set(overrides) - set(JOB_KEYS)
-    if unknown:
-        raise ValueError(f"配置：未知的作业覆盖项 {', '.join(sorted(unknown))}")
-    # 模板刻意注释掉了 [job]：明确传入的覆盖项可以补齐缺失的键，没传的仍然必须来自配置。
-    job_defaults = {key: overrides[key] if key in overrides else required("job", key)
-                    for key in JOB_KEYS}
-    row = RowSpec(**job_defaults)
+    source = job_source or PresetJobSource()
+    row = source.build(cfg, job_overrides or {})
     geometry = _known_geometry()
     lead = required("servo", "lead_mm")
     if abs(lead - geometry.servo_lead_mm) > 1e-4:
@@ -159,8 +176,8 @@ def _read_live_configuration(path: Path, confirmed: bool,
     # Z 工件零点。真正防扎管的是下面那条"必须高过排内最高工作点"。
     if scan_z > required("cnc3d", "z_max"):
         raise ValueError("配置：scan_z_mm 超出 CNC Z 软限位")
-    plan = plan_row(row, geometry)
-    if (max(p.cnc_x_mm for p in plan.placements) > required("cnc3d", "x_max")
+    plan = source.plan(row, geometry)
+    if (max(max(p.cnc_x_mm, *(hit[0] for hit in p.needle_hits)) for p in plan.placements) > required("cnc3d", "x_max")
             or max(p.cnc_y_mm for p in plan.placements) > required("cnc3d", "y_max")):
         raise ValueError("配置：排程落点超出 CNC X/Y 软限位")
     # 排间安全高度必须高过排内**最高**的工作点。theta 带符号：正角时最高点在排尾、
@@ -308,7 +325,7 @@ class RowTurnGate:
             self._waiting = True
             self._answer = False
         print(f"第 {completed_rows} 排已完成：滑台已抬到安全高度并回到排头。"
-              "请剪断五根丝、把管子转过一个周向位置，确认后按回车继续下一排；"
+              "请剪断两根丝、把管子转过一个周向位置，确认后按回车继续下一排；"
               "不再跑下一排请输入 D；输入 ! 停止。",
               file=self.output, flush=True)
         try:
@@ -455,9 +472,10 @@ def _make_reporter(row, plan, motion, scan_z, results_dir, *, datum=None):
         return None
 
 
-def _execute_live_job(cfg: dict, row: RowSpec, motion: HeadMotion, scan_z: float,
+def _execute_live_job(cfg: dict, row: PresetSpec, motion: HeadMotion, scan_z: float,
                       plan, devices: LiveDevices, *, datum=None, rows: int | None = None,
-                      results_dir: Path | None = None, echo=None) -> int:
+                      results_dir: Path | None = None, echo=None,
+                      command_reader=None) -> int:
     gate = OperatorGate()
     turn_gate = RowTurnGate()
     reporter = _make_reporter(row, plan, motion, scan_z, results_dir, datum=datum)
@@ -473,12 +491,16 @@ def _execute_live_job(cfg: dict, row: RowSpec, motion: HeadMotion, scan_z: float
             return False
         return turn_gate.wait_for_turn(completed_rows, cancel)
 
-    print("实时运行：每次五针退回且 B 阀排气后，请剪丝并按回车移动到下一落点；"
+    print("实时运行：每次两针退回且 B 阀排气后，请剪丝并按回车移动到下一落点；"
           "一排跑完后滑台抬到安全高度并回到排头，剪丝转管后按回车继续下一排；"
           "输入 D 正常收工，输入 ! 请求三路停止。")
     commands: queue.Queue[str] = queue.Queue()
     stop_reading = threading.Event()
-    reader = threading.Thread(target=_read_stop_commands, args=(commands,),
+    # 指令来源可替换：终端里是 `_read_stop_commands` 阻塞在 input() 上，图形界面里
+    # 没有终端可读，改由按钮往同一个队列投递。**下面那条分派循环因此一行都不用改**
+    # ——急停仍然是 "!"、继续仍然是空串、收工仍然是 "D"，走的还是同一条安全路径。
+    reader_fn = _read_stop_commands if command_reader is None else command_reader
+    reader = threading.Thread(target=reader_fn, args=(commands,),
                               kwargs={"echo": echo, "stopped": stop_reading}, daemon=True)
     reader.start()
     holder: list = []
@@ -535,9 +557,16 @@ def _execute_live_job(cfg: dict, row: RowSpec, motion: HeadMotion, scan_z: float
 def run_live(config_path: Path, confirmed: bool,
              job_overrides: dict[str, float] | None = None, *,
              datum: tuple[float, float] | None = None, rows: int | None = None,
-             results_dir: Path | None = None, debug: bool = False) -> int:
+             results_dir: Path | None = None, debug: bool = False,
+             menu=None, command_reader=None, job_source=None) -> int:
+    """实机总入口。
+
+    `menu` 和 `command_reader` 是给图形界面的两个注入点，留空就是原来的终端行为：
+    安全设置菜单需要一个能说话的对象，急停指令需要一个能读的来源——打包成无控制台
+    窗口时 `sys.stdin` 是 None，这两处原样走 `input()` 会直接抛异常。
+    """
     cfg, row, geometry, motion, scan_z, plan, datum = _read_live_configuration(
-        config_path, confirmed, job_overrides, datum=datum)
+        config_path, confirmed, job_overrides, datum=datum, job_source=job_source)
     echo = _make_echo(debug)
     devices = _open_live_devices(cfg, geometry, motion, echo=echo)
     if results_dir is None:
@@ -549,11 +578,12 @@ def run_live(config_path: Path, confirmed: bool,
               f"滑台软件读数={devices.head.position_mm():.3f} mm；"
               f"预期安全高度 Z={scan_z:g} mm，对刀点 X={datum[0]:g} Z={datum[1]:g} mm。"
               f"读数不能证明机械零位。")
-        if not _prepare_live_zeros(devices.servo, devices.head):
+        if not _prepare_live_zeros(devices.servo, devices.head, menu=menu):
             print("已取消，未开始自动植入。")
             return 1
         return _execute_live_job(cfg, row, motion, scan_z, plan, devices, datum=datum,
-                                 rows=rows, results_dir=results_dir, echo=echo)
+                                 rows=rows, results_dir=results_dir, echo=echo,
+                                 command_reader=command_reader)
     finally:
         _close_live_devices(devices)
 
@@ -567,8 +597,7 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--live", action="store_true", help="connect to actual machine after preflight")
     parser.add_argument("--angle", type=float,
                         help="架子角度 θ（度，带符号；正值 = 管面朝 +x 上升）")
-    parser.add_argument("--length", type=float, help="一排的强化区长度 mm")
-    parser.add_argument("--spacing", type=float, help="点距 mm")
+    parser.add_argument("--count", type=int, help="每排植入根数（菜单预设 7/10/15）")
     parser.add_argument("--depth", type=float, help="沿垂直管面的植入深度 mm（1-3）")
     parser.add_argument("--datum-x", type=float, help="对刀点的 CNC X mm（非交互实机路径必填）")
     parser.add_argument("--datum-z", type=float, help="对刀点的 CNC Z mm（非交互实机路径必填）")
@@ -596,8 +625,7 @@ def main(argv: list[str] | None = None) -> int:
                                     results_dir=args.results_dir, debug=args.debug)
         if args.live:
             overrides = {key: value for key, value in
-                         (("angle_deg", args.angle), ("length_mm", args.length),
-                          ("spacing_mm", args.spacing), ("depth_mm", args.depth))
+                         (("angle_deg", args.angle), ("count", args.count), ("depth_mm", args.depth))
                          if value is not None}
             if not args.confirm_datum:
                 # 没有 --confirm-datum 就进交互向导；分派放在这里而不是 run_live 里，
@@ -619,10 +647,9 @@ def main(argv: list[str] | None = None) -> int:
                 extra["rows"] = args.rows
             return run_live(args.config, args.confirm_datum, job_overrides=overrides,
                             datum=datum, debug=args.debug, **extra)
-        row = RowSpec(*[value if value is not None else SMOKE_JOB[key]
+        row = PresetSpec(*[value if value is not None else SMOKE_JOB[key]
                         for key, value in (("angle_deg", args.angle),
-                                           ("length_mm", args.length),
-                                           ("spacing_mm", args.spacing),
+                                           ("count", args.count),
                                            ("depth_mm", args.depth))])
         return run_simulation(row, inject_failure=args.inject_failure,
                               rows=SMOKE_ROWS if args.smoke_test else 1)

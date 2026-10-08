@@ -25,7 +25,8 @@ travel_mm = 50.0          # nominal slide travel; NOT the software work window
 firmware_verified = false # set true only after flashing and checking protocol 2 firmware
 datum_confirmed = false  # set true only after measuring the signed useful window
 # standby_mm = 0.0        # physical standby is manually confirmed then set to software zero
-# insertion_mm is DERIVED, not configured: it is depth/cos(theta), measured
+# Automatic insertion_mm is DERIVED: -depth/cos(theta). Custom mode instead uses
+# the explicit slide travel within the confirmed window. Depth is measured
 # perpendicular to the tube wall. A value written here is ignored.
 # work_min_mm = -10.0     # example only: actual safe down limit must be measured
 # work_max_mm = 0.0       # firmware prohibits motion above standby
@@ -34,9 +35,8 @@ datum_confirmed = false  # set true only after measuring the signed useful windo
 valve_delay_ms = 500
 upper_release_after_retract = false  # confirm on machine before full job
 
-# [job]                  # defaults; explicit --angle/--length/--spacing/--depth override one run.
+# [job]                  # defaults; explicit --angle/--count/--depth override one run.
                          # One job is one row; the tube is turned by hand and the row repeats.
 # angle_deg = 15.0       # signed: the tube is fixtured, the needles stay vertical
-# length_mm = 20.0       # reinforced span, NOT the stock length
-# spacing_mm = 2.0
+# count = 7              # preset density 7/10/15; fixed 20 mm zone, fixed 10 mm needle pitch
 # depth_mm = 2.0         # perpendicular to the tube wall; hard limit 3 mm (metal joint below)

@@ -25,7 +25,7 @@ def make_menu(*, input_fn=None, output=None):
 
 def run_startup_menu(*, config_path, results_dir=None, debug=False, menu=None,
                      wizard_fn=None, simulate_fn=None, profile_manager_fn=None,
-                     manual_fn=None) -> int:
+                     custom_fn=None, preset_fn=None) -> int:
     """没有给模式参数、且在终端里直接运行时进入这里。
 
     选定一项就执行并返回它的退出码，**不弹回菜单**：实机跑完机器处于需要人工
@@ -36,11 +36,11 @@ def run_startup_menu(*, config_path, results_dir=None, debug=False, menu=None,
     这类脚本化调用不受影响，否则自动化会挂在那里等输入。
     """
     from master.master import SMOKE_JOB, SMOKE_ROWS, _known_geometry, run_simulation
-    from master.manual import run_manual_menu
-    from master.model import RowSpec
+    from master.custom import run_custom_menu
+    from master.model import PresetSpec
     from master.profile_ui import run_profile_manager
     from master.profiles import ProfileStore
-    from master.wizard import WizardCancelled, collect_job, run_setup_wizard
+    from master.wizard import WizardCancelled, collect_preset, run_setup_wizard
 
     menu = make_menu() if menu is None else menu
     wizard_fn = run_setup_wizard if wizard_fn is None else wizard_fn
@@ -57,12 +57,13 @@ def run_startup_menu(*, config_path, results_dir=None, debug=False, menu=None,
                 ("1", "实机运行（会连接并可能移动机构）"),
                 ("2", "仿真（不接硬件）"),
                 ("3", f"自检（参考作业 θ=+{SMOKE_JOB['angle_deg']:g}° / 强化区 "
-                      f"{SMOKE_JOB['length_mm']:g} / 点距 {SMOKE_JOB['spacing_mm']:g} / "
+                      f"20 mm / {SMOKE_JOB['count']} 根 / "
                       f"{SMOKE_ROWS} 排）"),
                 ("4", f"调试输出：{'开' if debug_on else '关'}"),
                 ("5", f"配置档案（机器：{selection['machine'] or '未选择'}；"
-                      f"作业：{selection['job'] or '未选择'}）"),
-                ("6", "组件手动控制"),
+                      f"自定义：{selection['custom'] or '未选择'}）"),
+                ("6", "完全自定义"),
+                ("7", "预设任务（实机 / 仿真）"),
                 ("0", "退出"),
             ))
         except WizardCancelled:
@@ -73,7 +74,7 @@ def run_startup_menu(*, config_path, results_dir=None, debug=False, menu=None,
             menu.say(f"调试输出已{'开启' if debug_on else '关闭'}。")
             continue
         if choice == "5":
-            selection = profile_manager_fn(store, menu, Path(config_path), _known_geometry())
+            selection = profile_manager_fn(store, menu, Path(config_path))
             continue
         if choice == "0":
             return 0
@@ -85,18 +86,23 @@ def run_startup_menu(*, config_path, results_dir=None, debug=False, menu=None,
             # 会让 WizardCancelled 一路逃出 main 的 except 元组，未捕获异常直接结束进程
             # ——双击启动时就是窗口一闪而过，操作员看不到任何解释。
             try:
-                row, _ = collect_job(menu, _known_geometry())
+                row, _ = collect_preset(menu, _known_geometry())
             except WizardCancelled as exc:
                 menu.say(f"已取消（{exc}），未开始仿真；回到菜单。")
                 continue
             code = simulate_fn(row)
         elif choice == "3":
-            code = simulate_fn(RowSpec(**SMOKE_JOB), rows=SMOKE_ROWS)
-        else:
-            if manual_fn is None:
-                manual_fn = run_manual_menu
-            code = manual_fn(store=store, selection=selection,
+            code = simulate_fn(PresetSpec(**SMOKE_JOB), rows=SMOKE_ROWS)
+        elif choice == "6":
+            if custom_fn is None:
+                custom_fn = run_custom_menu
+            code = custom_fn(store=store, selection=selection,
                              config_path=Path(config_path), debug=debug_on)
+        else:
+            task = run_preset_task if preset_fn is None else preset_fn
+            code = task(config_path=Path(config_path), results_dir=results_dir,
+                        debug=debug_on, menu=menu, profile_store=store,
+                        profile_selection=selection)
         _hold_before_exit(menu)
         return code
 
@@ -115,3 +121,26 @@ def _hold_before_exit(menu) -> None:
         menu.ask("按回车退出")
     except WizardCancelled:
         pass
+
+
+def run_preset_task(*, config_path, menu, results_dir=None, debug=False,
+                    profile_store=None, profile_selection=None, command_reader=None,
+                    wizard_fn=None, simulate_fn=None):
+    """Shared preset entry: choose execution mode before collecting the task."""
+    from master.master import _known_geometry, run_simulation
+    from master.wizard import WizardCancelled, collect_preset, run_setup_wizard
+    try:
+        mode = menu.choose("预设任务运行方式", (("1", "实机（会连接并可能移动机构）"),
+                                              ("2", "仿真（不接硬件）"), ("0", "返回")))
+        if mode == "0":
+            return 0
+        if mode == "1":
+            return (wizard_fn or run_setup_wizard)(
+                Path(config_path), results_dir=results_dir, debug=debug,
+                wizard=menu, menu=menu, command_reader=command_reader,
+                profile_store=profile_store, profile_selection=profile_selection)
+        row, plan = collect_preset(menu, _known_geometry())
+        return (simulate_fn or run_simulation)(row, plan=plan)
+    except WizardCancelled:
+        menu.say("预设任务已取消。")
+        return 0

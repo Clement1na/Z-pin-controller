@@ -4,15 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from master.local_config import load_merged
 from master.profiles import ProfileNameError, ProfileStore
-from master.wizard import WizardCancelled, collect_job, job_values
+from master.wizard import WizardCancelled
 
 
 def _select_existing(store: ProfileStore, menu, kind: str,
                      current: str | None) -> str | None:
     names = store.list_names(kind)
-    label = "机器配置" if kind == "machines" else "作业方案"
+    label = {"machines": "机器配置", "custom": "自定义配置"}[kind]
     if not names:
         menu.warn(f"还没有可选择的{label}。")
         return current
@@ -25,7 +24,7 @@ def _select_existing(store: ProfileStore, menu, kind: str,
 
 
 def _ask_name(store: ProfileStore, menu, kind: str) -> str:
-    label = "机器配置" if kind == "machines" else "作业方案"
+    label = {"machines": "机器配置", "custom": "自定义配置"}[kind]
     while True:
         try:
             name = menu.ask(f"请输入{label}名称")
@@ -38,25 +37,20 @@ def _ask_name(store: ProfileStore, menu, kind: str) -> str:
             menu.warn(str(exc))
 
 
-def run_profile_manager(store: ProfileStore, menu, config_path: Path,
-                        geometry=None) -> dict[str, str | None]:
+def run_profile_manager(store: ProfileStore, menu, config_path: Path) -> dict[str, str | None]:
     """Create/select named profiles and persist the current pair."""
-    if geometry is None:
-        from master.master import _known_geometry
-        geometry = _known_geometry()
     selection = store.load_selection()
     local_path = Path(config_path).parent / "config.local.toml"
     while True:
         menu.say("")
         menu.say("=== 配置档案 ===")
         menu.say(f"当前机器配置：{selection['machine'] or '未选择'}")
-        menu.say(f"当前作业方案：{selection['job'] or '未选择'}")
+        menu.say(f"当前自定义配置：{selection['custom'] or '未选择'}")
         try:
             choice = menu.choose("操作", (
                 ("1", "导入当前 config.local.toml 并命名为机器配置"),
-                ("2", "新建作业方案"),
-                ("3", "选择机器配置"),
-                ("4", "选择作业方案"),
+                ("2", "选择机器配置"),
+                ("3", "选择自定义配置"),
                 ("0", "返回"),
             ))
         except WizardCancelled:
@@ -74,24 +68,11 @@ def run_profile_manager(store: ProfileStore, menu, config_path: Path,
             store.save_selection(**selection)
             menu.say(f"已保存机器配置：{name}")
         elif choice == "2":
-            name = _ask_name(store, menu, "jobs")
-            defaults = load_merged(Path(config_path)).get("job", {})
-            try:
-                row, _ = collect_job(menu, geometry, defaults=defaults)
-            except WizardCancelled:
-                menu.say("已取消新建作业方案。")
-                continue
-            values = {"job": {**job_values(row), "rows": 1}}
-            store.save("jobs", name, values)
-            selection["job"] = name
-            store.save_selection(**selection)
-            menu.say(f"已保存作业方案：{name}")
-        elif choice == "3":
             selection["machine"] = _select_existing(
                 store, menu, "machines", selection["machine"])
             store.save_selection(**selection)
-        elif choice == "4":
-            selection["job"] = _select_existing(
-                store, menu, "jobs", selection["job"])
+        elif choice == "3":
+            selection["custom"] = _select_existing(
+                store, menu, "custom", selection["custom"])
             store.save_selection(**selection)
 

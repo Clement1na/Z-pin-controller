@@ -28,17 +28,19 @@ Set-Location $root
 $target = Join-Path $root "dist\ZpinControl"
 
 # PyInstaller runs with --noconfirm, which DELETES dist\ZpinControl before it
-# rebuilds. config.toml survives that below because it can be re-copied from the
-# template, but config.local.toml has no template: the wizard writes it from what
-# was measured on THIS machine (ports, limits, datum). Losing it means re-running
-# the whole wizard against live hardware. Park it outside the tree first, and put
-# it back even if the build fails.
-$localConfig = Join-Path $target "config.local.toml"
-$parked = Join-Path $env:TEMP "zpin-config-local-parked.toml"
-$hasLocal = Test-Path $localConfig
-if ($hasLocal) {
-    Copy-Item $localConfig $parked -Force
-    Write-Host "parked $localConfig"
+# rebuilds. Preserve measured configuration, named profiles and job records
+# outside that directory first; restore them even when the build fails.
+$parked = Join-Path $env:TEMP ("zpin-user-state-" + [guid]::NewGuid().ToString("N"))
+$stateNames = @("config.toml", "config.local.toml", "profiles", "runs")
+$savedNames = @()
+foreach ($name in $stateNames) {
+    $source = Join-Path $target $name
+    if (Test-Path -LiteralPath $source) {
+        New-Item -ItemType Directory -Path $parked -Force | Out-Null
+        Copy-Item -LiteralPath $source -Destination $parked -Recurse -Force
+        $savedNames += $name
+        Write-Host "parked $source"
+    }
 }
 
 try {
@@ -49,10 +51,14 @@ try {
         throw "PyInstaller failed with exit code $LASTEXITCODE"
     }
 } finally {
-    if ($hasLocal -and (Test-Path $parked)) {
-        Copy-Item $parked $localConfig -Force
-        Remove-Item $parked -Force
-        Write-Host "restored $localConfig"
+    if ($savedNames.Count -gt 0) {
+        New-Item -ItemType Directory -Path $target -Force | Out-Null
+        foreach ($name in $savedNames) {
+            Copy-Item -LiteralPath (Join-Path $parked $name) -Destination $target -Recurse -Force
+            Write-Host "restored $name"
+        }
+        # Retain the independent backup for recovery if the build failed.
+        Write-Host "user-state backup: $parked"
     }
 }
 
@@ -72,7 +78,12 @@ Copy-Item (Join-Path $PSScriptRoot "README.md") (Join-Path $target "使用说明
 Write-Host ""
 Write-Host "Built: $target"
 Write-Host ""
-Write-Host "Acceptance test:"
+Write-Host "Acceptance test (console):"
 Write-Host "  cd `"$target`""
 Write-Host "  .\ZpinControl.exe --smoke-test"
-Write-Host "  expect: 已完成：18 个落点，共 3 排（每排 6 个） / 阀门已关闭 / 退出码 0"
+Write-Host "  expect: 12 placements in 3 rows, valves closed, exit code 0"
+Write-Host ""
+Write-Host "Acceptance test (windowed):"
+Write-Host "  double-click ZpinControlUI.exe"
+Write-Host "  expect: window opens with NO console behind it; click the smoke-test"
+Write-Host "          button and the same 12 placements appear in the log pane"

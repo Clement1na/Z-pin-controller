@@ -1,17 +1,17 @@
-"""Pure five-head row planner. No device access is permitted here."""
+"""Pure row planner. No device access is permitted here."""
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
-from master.model import MachineGeometry, RowSpec
+from master.model import PRESET_NEEDLES, PRESET_PITCH_MM, MachineGeometry, PresetSpec
 
 
 @dataclass(frozen=True)
 class Placement:
-    """One simultaneous five-head stroke. The CNC work height is not stored here:
-    it depends on the datum read at touch-off, which happens after planning."""
+    """One simultaneous stroke of the loaded needle group. The CNC work height is
+    not stored here: it depends on the datum read at touch-off, which happens
+    after planning."""
 
     cnc_x_mm: float
     cnc_y_mm: float
@@ -26,47 +26,43 @@ class RowPlan:
     placements: tuple[Placement, ...]
 
 
-def _choose_pitch(row: RowSpec, machine: MachineGeometry) -> tuple[int, float]:
-    """Pick the calibrated pitch closest to 12 mm, as a whole number of grid steps."""
-    spacing = row.spacing_mm
-    min_step = math.ceil(machine.station_width_mm / spacing - 1e-9)
-    max_step = math.floor((machine.station_width_mm + machine.max_expansion_mm) / spacing + 1e-9)
-    candidates: list[tuple[int, float]] = []
-    for step in range(max(1, min_step), max_step + 1):
-        pitch = step * spacing
-        expansion = pitch - machine.station_width_mm
-        if -1e-9 <= expansion <= machine.max_expansion_mm + 1e-9:
-            candidates.append((step, pitch))
-    if not candidates:
-        raise ValueError("标定的针距里没有任何一个能整除 spacing_mm")
-    return min(candidates, key=lambda item: (abs(item[1] - 12.0), item[1]))
+def _hits(base_mm: float, pitch_mm: float) -> tuple[tuple[float, float], ...]:
+    """The loaded needles for one stroke, at ``base + station * pitch``.
 
-
-def plan_row(row: RowSpec, machine: MachineGeometry) -> RowPlan:
-    """Cover one reinforced row with simultaneous five-head strokes.
-
-    A block spans ``station_count * step`` grid points. Repeating the needle array
-    at adjacent grid offsets fills that block exactly once. The last block is
-    allowed to be **partial**: the needle array is 40-80 mm wide while the
-    reinforced zone is ~20 mm, so overhanging needles are the normal case. They
-    still meet the tube wall (the real stock is longer) and the overhang is cut
-    off afterwards, so a short final block is not an error.
+    Only ``PRESET_NEEDLES`` stations carry a needle. Walking
+    ``machine.station_count`` here would invent hits for the three empty
+    stations and hand the operator a pin count that is not on the machine.
     """
-    step, pitch = _choose_pitch(row, machine)
-    expansion = pitch - machine.station_width_mm
-    spacing = row.spacing_mm
+    return tuple((base_mm + station * pitch_mm, 0.0) for station in range(PRESET_NEEDLES))
+
+
+def plan_preset_row(spec: PresetSpec, machine: MachineGeometry) -> RowPlan:
+    """Cover the preset's fixed 20 mm zone with simultaneous two-needle strokes.
+
+    The pitch is the mechanical base spacing, so the servo target is exactly 0
+    and the servo never moves. ``spec.spacing_mm`` is derived from the pin count
+    (``10 / pairs``), which is what makes the union of the strokes a uniform
+    grid; an odd count gets one extra stroke for the last pin, whose second
+    needle overhangs the zone. That overhang is recorded like any other -- the
+    stock is longer and it is cut off afterwards.
+    """
+    if PRESET_NEEDLES > machine.station_count:
+        raise ValueError(
+            f"预设需要 {PRESET_NEEDLES} 根针，但机器只有 {machine.station_count} 个工位"
+        )
+    if abs(machine.station_width_mm - PRESET_PITCH_MM) > 1e-9:
+        raise ValueError("预设要求机械基准针距为 10 mm，请核对机器标定")
+    pitch = machine.station_width_mm
+    spacing = spec.spacing_mm
     placements: list[Placement] = []
-    block_size = machine.station_count * step
-    for block in range(0, row.x_count, block_size):
-        for offset in range(step):
-            index = block + offset
-            if index >= row.x_count:
-                continue
-            base = index * spacing
-            hits = tuple((base + station * pitch, 0.0)
-                         for station in range(machine.station_count))
-            placements.append(Placement(base, 0.0, hits))
-    return RowPlan(pitch, machine.servo_target_mm(expansion), row.slope, tuple(placements))
+    for index in range(spec.pairs):
+        base = index * spacing
+        placements.append(Placement(base, 0.0, _hits(base, pitch)))
+    if spec.count % 2:
+        base = (spec.count - 1) * spacing
+        placements.append(Placement(base, 0.0, _hits(base, pitch)))
+    # 针距锁在机械基准间距，伺服不动 —— 目标就是 0，不是算出来的 -0.0。
+    return RowPlan(pitch, 0.0, spec.slope, tuple(placements))
 
 
 def work_z_mm(plan: RowPlan, cnc_x_mm: float, datum: tuple[float, float]) -> float:

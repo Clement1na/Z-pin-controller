@@ -1,4 +1,4 @@
-"""Named machine/job profile storage for the interactive CLI."""
+"""Named machine/custom profile storage for the interactive CLI."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Mapping
 from master.local_config import dumps, load_merged
 
 
-_PROFILE_DIRS = {"machines": "machines", "jobs": "jobs"}
+_PROFILE_DIRS = {"machines": "machines", "custom": "custom"}
 _INVALID_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL",
@@ -76,12 +76,11 @@ def _overlay(base: Mapping[str, Mapping[str, object]],
 
 
 class ProfileStore:
-    """Persist named machine/job TOML files beside the executable."""
+    """Persist named machine/custom TOML files beside the executable."""
 
     def __init__(self, root: Path):
         self.root = Path(root)
         self.machine_dir = self.root / "machines"
-        self.job_dir = self.root / "jobs"
         self.selection_path = self.root / "selection.toml"
 
     def _path(self, kind: str, name: str) -> Path:
@@ -127,27 +126,27 @@ class ProfileStore:
 
     def load_selection(self) -> dict[str, str | None]:
         if not self.selection_path.exists():
-            return {"machine": None, "job": None}
+            return {"machine": None, "custom": None}
         values = _read_toml(self.selection_path).get("selection", {})
         if not isinstance(values, Mapping):
             raise ValueError("selection.toml 的 [selection] 必须是表")
         machine = values.get("machine") or None
-        job = values.get("job") or None
+        custom = values.get("custom") or None
         if machine is not None:
             validate_profile_name(machine)
-        if job is not None:
-            validate_profile_name(job)
-        return {"machine": machine, "job": job}
+        if custom is not None:
+            validate_profile_name(custom)
+        return {"machine": machine, "custom": custom}
 
-    def save_selection(self, *, machine: str | None, job: str | None) -> None:
+    def save_selection(self, *, machine: str | None, custom: str | None) -> None:
         if machine is not None:
             validate_profile_name(machine)
-        if job is not None:
-            validate_profile_name(job)
+        if custom is not None:
+            validate_profile_name(custom)
         self.root.mkdir(parents=True, exist_ok=True)
         content = dumps({"selection": {
             "machine": machine or "",
-            "job": job or "",
+            "custom": custom or "",
         }})
         tmp = self.selection_path.with_name(self.selection_path.name + ".tmp")
         with tmp.open("w", encoding="utf-8", newline="\n") as stream:
@@ -157,10 +156,10 @@ class ProfileStore:
         os.replace(tmp, self.selection_path)
 
     def compose(self, template: Path, *, machine: str | None = None,
-                job: str | None = None) -> dict:
+                custom: str | None = None) -> dict:
         base = load_merged(Path(template))
         if machine:
             base = _overlay(base, self.load("machines", machine))
-        if job:
-            base = _overlay(base, self.load("jobs", job))
+        if custom:
+            base = _overlay(base, self.load("custom", custom))
         return base
