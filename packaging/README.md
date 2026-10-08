@@ -32,9 +32,9 @@ powershell -File packaging\build.ps1 -Python C:\Python313\python.exe
 脚本（报 `无法加载文件……因为在此系统上禁止运行脚本`）时，才需要你自己决定是否
 放行；不要在没看懂那条策略是干什么的情况下随手加 `Bypass`。
 
-构建脚本会做三件事：跑 PyInstaller、把 `master\config.toml` 模板复制成 exe 旁边的
-`config.toml`（**已存在就不覆盖**，免得抹掉现场量出来的串口号和软限位）、把本文件
-复制成 `使用说明.md`。
+打包前请关闭正在运行的 Z-pin 程序。脚本先在独立目录构建，检查解释器、标准库与界面运行文件齐全后，才替换交付目录；构建失败不会清空原包。
+
+替换时保留已有的 `config.toml`、`config.local.toml`、`profiles` 和 `runs`，没有配置才使用模板，并复制本文件为 `使用说明.md`。上一份目录保留在 `build/previous-delivery-*`，便于恢复。
 
 验收（改完代码或换机器后都该跑一遍）：
 
