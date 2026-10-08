@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import queue
+from copy import deepcopy
 import tkinter as tk
 from pathlib import Path
 from tkinter import font as tkfont
@@ -59,6 +60,8 @@ class MainWindow:
         self.config_path = Path(config_path)
         self.results_dir = results_dir
         self._closing = False
+        self._prepared_config = None
+        self._configuration_results = queue.Queue()
         self.menu = TkMenu(root, sink)
         self.store = ProfileStore(self.config_path.parent / "profiles")
         self.selection = self.store.load_selection()
@@ -89,6 +92,7 @@ class MainWindow:
         modes = ttk.Frame(outer)
         modes.pack(fill="x", pady=(8, 0))
         for label, command in (
+            ("接口与机器配置", self._configure_interfaces),
             ("实机运行（会连接并可能移动机构）", self._live),
             ("仿真（不接硬件）", self._simulate),
             ("自检", self._smoke),
@@ -134,6 +138,7 @@ class MainWindow:
         try:
             self._drain_log()
             self._drain_finished()
+            self._drain_configuration()
             self._sync_buttons()
             if self._closing and not self.runner.running:
                 self._destroyed = True
@@ -174,7 +179,10 @@ class MainWindow:
                 self._note(f"运行失败：{error}")
             else:
                 self._note(f"运行结束，退出码 {code}。")
-            self.selection = self.store.load_selection()
+            selection = self.store.load_selection()
+            if selection != self.selection:
+                self._prepared_config = None
+            self.selection = selection
             self._refresh_heading()
 
     def _sync_buttons(self) -> None:
@@ -206,6 +214,15 @@ class MainWindow:
 
     def _stop(self) -> None:
         if not self.runner.post(STOP):
+            # Settings may have returned just before this click, while their
+            # requested branch is still waiting for the next Tk poll.
+            while True:
+                try:
+                    _branch, _cfg, _selection, cancel_event = self._configuration_results.get_nowait()
+                except queue.Empty:
+                    break
+                cancel_event.set()
+                self._prepared_config = None
             self._note("当前没有在运行。")
             return
         self._note("已请求急停：滑台急停、CNC 保持、伺服卸使能由总控按既有安全路径执行。")
@@ -217,6 +234,64 @@ class MainWindow:
 
     # ------------------------------------------------------------------ 五个入口
     def _live(self) -> None:
+        self._configured_branch("live")
+
+    def _configured_branch(self, branch):
+        self._drain_configuration()
+        if self.runner.running:
+            self._note("已有流程正在运行。")
+            return
+        if self._prepared_config is None:
+            self._configure_interfaces(branch)
+        else:
+            self._launch_configured(branch, deepcopy(self._prepared_config))
+
+    def _configure_interfaces(self, branch=None):
+        if self.runner.running:
+            self._note("已有流程正在运行。")
+            return
+        self._prepared_config = None
+        selection = dict(self.selection)
+        from master.interfaces import prepare_interfaces
+
+        def flow(reader):
+            try:
+                cfg = prepare_interfaces(self.config_path, self.menu,
+                                         store=self.store, selection=selection)
+            except WizardCancelled:
+                self._note("接口与机器配置已取消。")
+                return 0
+            self._configuration_results.put((branch, deepcopy(cfg), dict(selection), reader.cancel_event))
+            return 0
+
+        self._start(flow, "接口与机器配置（不连接设备）")
+
+    def _drain_configuration(self):
+        if self.runner.running:
+            return
+        try:
+            branch, cfg, selection, cancel_event = self._configuration_results.get_nowait()
+        except queue.Empty:
+            return
+        if self._closing or cancel_event.is_set() or cfg is None:
+            self._prepared_config = None
+            return
+        self.selection = selection
+        self._prepared_config = deepcopy(cfg)
+        self._refresh_heading()
+        self._note("接口与机器配置已就绪；实机和自定义共用本次选择。")
+        if branch is not None:
+            self._launch_configured(branch, deepcopy(cfg))
+
+    def _launch_configured(self, branch, prepared_config):
+        if branch == "custom":
+            from master.gui.custom_page import CustomPage
+            page = CustomPage(self.root, store=self.store, selection=dict(self.selection),
+                              config_path=self.config_path, debug=self.debug_var.get(), menu=self.menu,
+                              prepared_config=prepared_config,
+                              on_configuration_changed=self._invalidate_configuration)
+            self._start(page.run, "完全自定义")
+            return
         from master.wizard import run_setup_wizard
 
         debug = self.debug_var.get()
@@ -225,12 +300,30 @@ class MainWindow:
         results_dir = self.results_dir
 
         def flow(reader):
-            return run_setup_wizard(
-                config_path, results_dir=results_dir, debug=debug,
-                wizard=self.menu, menu=self.menu, command_reader=reader,
-                profile_store=self.store, profile_selection=selection)
+            try:
+                return run_setup_wizard(
+                    config_path, results_dir=results_dir, debug=debug,
+                    wizard=self.menu, menu=self.menu, command_reader=reader,
+                    profile_store=self.store, profile_selection=selection,
+                    prepared_config=prepared_config)
+            finally:
+                self._cache_persisted_configuration(reader)
 
         self._start(flow, "实机运行（会连接并可能移动机构）")
+
+    def _invalidate_configuration(self):
+        self._prepared_config = None
+
+    def _cache_persisted_configuration(self, reader):
+        """Worker-side refresh after the live wizard persists calibration changes."""
+        from master.local_config import load_merged
+        try:
+            cfg = load_merged(self.config_path)
+            selection = self.store.load_selection()
+        except Exception as exc:
+            self._note(f"无法刷新共享配置：{exc}；下次运行将重新选择。")
+            cfg, selection = None, {}
+        self._configuration_results.put((None, deepcopy(cfg), dict(selection), reader.cancel_event))
 
     def _simulate(self) -> None:
         if self.runner.running:
@@ -261,6 +354,7 @@ class MainWindow:
             self._note('已有流程正在运行。')
             return
         self.menu.cancel_event.clear()
+        self._prepared_config = None
         from master.master import _known_geometry
         from master.profile_ui import run_profile_manager
 
@@ -276,21 +370,20 @@ class MainWindow:
         from master.menu import run_preset_task
         debug = self.debug_var.get()
         selection = dict(self.selection)
+        prepared_config = deepcopy(self._prepared_config)
         def flow(reader):
-            return run_preset_task(config_path=self.config_path, menu=self.menu,
-                                   results_dir=self.results_dir, debug=debug,
-                                   profile_store=self.store, profile_selection=selection,
-                                   command_reader=reader)
+            try:
+                return run_preset_task(config_path=self.config_path, menu=self.menu,
+                                       results_dir=self.results_dir, debug=debug,
+                                       profile_store=self.store, profile_selection=selection,
+                                       command_reader=reader, prepared_config=prepared_config)
+            finally:
+                if prepared_config is not None:
+                    self._cache_persisted_configuration(reader)
         self._start(flow, "预设任务")
 
     def _custom(self) -> None:
-        if self.runner.running:
-            self._note("已有流程正在运行。")
-            return
-        from master.gui.custom_page import CustomPage
-        page = CustomPage(self.root, store=self.store, selection=dict(self.selection),
-                          config_path=self.config_path, debug=self.debug_var.get(), menu=self.menu)
-        self._start(page.run, "完全自定义")
+        self._configured_branch("custom")
 
     # ------------------------------------------------------------------ 关闭
     def _on_close(self) -> None:

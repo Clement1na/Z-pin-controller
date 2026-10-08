@@ -25,7 +25,7 @@ def make_menu(*, input_fn=None, output=None):
 
 def run_startup_menu(*, config_path, results_dir=None, debug=False, menu=None,
                      wizard_fn=None, simulate_fn=None, profile_manager_fn=None,
-                     custom_fn=None, preset_fn=None) -> int:
+                     custom_fn=None, preset_fn=None, prepare_fn=None) -> int:
     """没有给模式参数、且在终端里直接运行时进入这里。
 
     选定一项就执行并返回它的退出码，**不弹回菜单**：实机跑完机器处于需要人工
@@ -40,6 +40,7 @@ def run_startup_menu(*, config_path, results_dir=None, debug=False, menu=None,
     from master.model import PresetSpec
     from master.profile_ui import run_profile_manager
     from master.profiles import ProfileStore
+    from master.interfaces import prepare_interfaces
     from master.wizard import WizardCancelled, collect_preset, run_setup_wizard
 
     menu = make_menu() if menu is None else menu
@@ -48,6 +49,8 @@ def run_startup_menu(*, config_path, results_dir=None, debug=False, menu=None,
     profile_manager_fn = run_profile_manager if profile_manager_fn is None else profile_manager_fn
     store = ProfileStore(Path(config_path).parent / "profiles")
     selection = store.load_selection()
+    prepare_fn = prepare_fn or prepare_interfaces
+    prepared = None
     debug_on = debug
     while True:
         menu.say("")
@@ -64,6 +67,7 @@ def run_startup_menu(*, config_path, results_dir=None, debug=False, menu=None,
                       f"自定义：{selection['custom'] or '未选择'}）"),
                 ("6", "完全自定义"),
                 ("7", "预设任务（实机 / 仿真）"),
+                ("8", "接口与机器配置（实机 / 自定义共用）"),
                 ("0", "退出"),
             ))
         except WizardCancelled:
@@ -75,12 +79,22 @@ def run_startup_menu(*, config_path, results_dir=None, debug=False, menu=None,
             continue
         if choice == "5":
             selection = profile_manager_fn(store, menu, Path(config_path))
+            prepared = None
             continue
         if choice == "0":
             return 0
+        if choice in ("1", "6", "8") and (prepared is None or choice == "8"):
+            try:
+                prepared = prepare_fn(Path(config_path), menu, store=store, selection=selection)
+            except WizardCancelled:
+                menu.say("已取消接口选择；回到菜单。")
+                continue
+        if choice == "8":
+            continue
         if choice == "1":
             code = wizard_fn(Path(config_path), results_dir=results_dir, debug=debug_on,
-                             profile_store=store, profile_selection=selection)
+                             profile_store=store, profile_selection=selection,
+                             prepared_config=prepared, wizard=menu, menu=menu)
         elif choice == "2":
             # 参数问答也必须接住取消。`menu.choose` 上面裹了，这里不裹的话 `Q`/Ctrl-C
             # 会让 WizardCancelled 一路逃出 main 的 except 元组，未捕获异常直接结束进程
@@ -97,12 +111,13 @@ def run_startup_menu(*, config_path, results_dir=None, debug=False, menu=None,
             if custom_fn is None:
                 custom_fn = run_custom_menu
             code = custom_fn(store=store, selection=selection,
-                             config_path=Path(config_path), debug=debug_on)
+                             config_path=Path(config_path), debug=debug_on,
+                             prepared_config=prepared, menu=menu)
         else:
             task = run_preset_task if preset_fn is None else preset_fn
             code = task(config_path=Path(config_path), results_dir=results_dir,
                         debug=debug_on, menu=menu, profile_store=store,
-                        profile_selection=selection)
+                        profile_selection=selection, prepared_config=prepared)
         _hold_before_exit(menu)
         return code
 
@@ -125,7 +140,7 @@ def _hold_before_exit(menu) -> None:
 
 def run_preset_task(*, config_path, menu, results_dir=None, debug=False,
                     profile_store=None, profile_selection=None, command_reader=None,
-                    wizard_fn=None, simulate_fn=None):
+                    wizard_fn=None, simulate_fn=None, prepared_config=None):
     """Shared preset entry: choose execution mode before collecting the task."""
     from master.master import _known_geometry, run_simulation
     from master.wizard import WizardCancelled, collect_preset, run_setup_wizard
@@ -138,7 +153,8 @@ def run_preset_task(*, config_path, menu, results_dir=None, debug=False,
             return (wizard_fn or run_setup_wizard)(
                 Path(config_path), results_dir=results_dir, debug=debug,
                 wizard=menu, menu=menu, command_reader=command_reader,
-                profile_store=profile_store, profile_selection=profile_selection)
+                profile_store=profile_store, profile_selection=profile_selection,
+                prepared_config=prepared_config)
         row, plan = collect_preset(menu, _known_geometry())
         return (simulate_fn or run_simulation)(row, plan=plan)
     except WizardCancelled:

@@ -143,10 +143,6 @@ def _read_live_configuration(path: Path, confirmed: bool,
     source = job_source or PresetJobSource()
     row = source.build(cfg, job_overrides or {})
     geometry = _known_geometry()
-    lead = required("servo", "lead_mm")
-    if abs(lead - geometry.servo_lead_mm) > 1e-4:
-        raise ValueError("配置：servo lead_mm 与实测标定冲突")
-    required("servo", "adapter")
     required("cnc3d", "port")
     required("head", "port")
     if cfg["cnc3d"]["port"] == cfg["head"]["port"]:
@@ -245,13 +241,8 @@ def _ask_jog(menu) -> float | None:
     return (1.0 if choice == "1" else -1.0) * distance
 
 
-def _prepare_live_zeros(servo, head, *, menu=None) -> bool:
-    """安全设置菜单。返回 True 表示可以开始自动植入。
-
-    动硬件之前必须由操作员逐项确认：先使能、再小步点动看机构、然后把当前点记为
-    零点。零点不满足就拒绝启动并说明缺哪一项——这一步不是走过场，断电重启后
-    伺服逻辑零点必然被清空，正常一次开机都要走这里。
-    """
+def _prepare_live_zeros(servo, head, *, menu=None, servo_required=True) -> bool:
+    """Confirm required zeros; optional servo setup remains available without blocking injection."""
     if menu is None:
         from master.menu import make_menu
         menu = make_menu()
@@ -260,7 +251,15 @@ def _prepare_live_zeros(servo, head, *, menu=None) -> bool:
     menu.say("警告：断电重启后，滑台和伺服都会把当前点当作软件零位；它不代表机械零位。")
     menu.say("先确认滑台处于安全待机位置；伺服应调整到靠紧的 2 mm 工位间距位置。")
     menu.say("已知方向：负距离张开、正距离靠紧；点动时须观察实际机构。")
-    menu.say(f"伺服相对本次连接初始读数：{servo.setup_offset_mm:+.3f} mm（不是机械基准）。")
+    if getattr(servo, "connected", True):
+        try:
+            menu.say(f"伺服相对本次连接初始读数：{servo.setup_offset_mm:+.3f} mm（不是机械基准）。")
+        except Exception as exc:
+            if servo_required:
+                raise
+            menu.warn(f"伺服状态读取失败：{exc}；请人工核对当前机械针距。")
+    elif not servo_required:
+        menu.warn("伺服不可用，未自动调整针距；请人工核对当前机械针距。")
     while True:
         menu.say("--- 安全设置 ---")
         try:
@@ -285,7 +284,7 @@ def _prepare_live_zeros(servo, head, *, menu=None) -> bool:
                 # 只列**还缺**的项。固定文案会把已经做完的那项也报出来，
                 # 操作员照着提示重做一遍是小事，怀疑自己做错了才是大事。
                 missing = [label for label, done in
-                           (("[3] 伺服设零", servo.origin_count is not None),
+                           (("[3] 伺服设零", not servo_required or servo.origin_count is not None),
                             ("[4] 滑台设零", head.zero_confirmed))
                            if not done]
                 if missing:
@@ -296,7 +295,7 @@ def _prepare_live_zeros(servo, head, *, menu=None) -> bool:
                 return False
         except WizardCancelled:
             return False
-        except (ValueError, RuntimeError, TimeoutError) as exc:
+        except Exception as exc:
             menu.warn(f"设置失败：{exc}")
 
 
@@ -363,6 +362,30 @@ class LiveDevices:
     head: object
 
 
+class UnavailableDevice:
+    """A disconnected component whose failure does not affect other components."""
+
+    connected = False
+    origin_count = None
+    zero_confirmed = False
+    setup_offset_mm = 0.0
+
+    def __init__(self, label, reason):
+        self.label, self.reason = label, str(reason)
+        self.cancel_event = None
+
+    def close(self):
+        pass
+
+    def disable(self):
+        pass
+
+    def __getattr__(self, name):
+        def unavailable(*args, **kwargs):
+            raise RuntimeError(f"{self.label} 不可用：{self.reason}")
+        return unavailable
+
+
 def _make_echo(debug: bool):
     """调试输出关闭时返回 None —— 设备层的约定是 None = 全静默。
 
@@ -400,21 +423,38 @@ def _open_head_serial(port, baud, **kwargs):
     return ser
 
 
+def _open_live_component(name, cfg, geometry, motion=None, *, echo=None):
+    """Construct only the requested component; preserve the head's no-reset serial opener."""
+    from master.devices import Cnc3D, InsertHead, ServoAxis
+    section = {"servo": "servo", "cnc": "cnc3d", "head": "head"}[name]
+    values = cfg.get(section, {})
+    interface = "adapter" if name == "servo" else "port"
+    if not values.get(interface):
+        raise ValueError(f"[{section}] 未选择{interface}")
+    if name == "servo":
+        lead = values.get("lead_mm", geometry.servo_lead_mm)
+        if not isinstance(lead, (int, float)) or isinstance(lead, bool) or not math.isfinite(lead) or abs(lead - geometry.servo_lead_mm) > 1e-4:
+            raise ValueError("servo lead_mm 与实测标定冲突")
+        return ServoAxis(adapter=values["adapter"], lead_mm=geometry.servo_lead_mm,
+                         counts_per_rev=values["counts_per_rev"], vel_mm_s=values["vel_mm_s"], echo=echo)
+    if name == "cnc":
+        return Cnc3D(port=values["port"], baud=values["baud"], feed=values["feed"],
+                     limits=(values["x_max"], values["y_max"], values["z_max"]), echo=echo)
+    return InsertHead(port=values["port"], baud=values.get("baud", 115200), travel_mm=values.get("travel_mm", 50.0),
+                      motion=motion, echo=echo, serial_factory=_open_head_serial)
+
+
 def _open_live_devices(cfg: dict, geometry: MachineGeometry, motion: HeadMotion, *,
                        echo=None) -> LiveDevices:
-    """只构造对象，不碰硬件。连接失败前不会有任何动作。"""
-    from master.devices import Cnc3D, InsertHead, ServoAxis
-
-    sv, cn, hd = cfg["servo"], cfg["cnc3d"], cfg["head"]
-    return LiveDevices(
-        servo=ServoAxis(adapter=sv["adapter"], lead_mm=geometry.servo_lead_mm,
-                        counts_per_rev=sv["counts_per_rev"], vel_mm_s=sv["vel_mm_s"],
-                        echo=echo),
-        cnc=Cnc3D(port=cn["port"], baud=cn["baud"], feed=cn["feed"],
-                  limits=(cn["x_max"], cn["y_max"], cn["z_max"]), echo=echo),
-        head=InsertHead(port=hd["port"], baud=hd["baud"],
-                        travel_mm=hd["travel_mm"], motion=motion, echo=echo,
-                        serial_factory=_open_head_serial))
+    """Live injection requires CNC/head; a servo error is reported independently."""
+    try:
+        servo = _open_live_component("servo", cfg, geometry, motion, echo=echo)
+    except Exception as exc:
+        print(f"警告：伺服不可用：{exc}；未自动调整针距，请人工核对。")
+        servo = UnavailableDevice("伺服", exc)
+    return LiveDevices(servo=servo,
+                       cnc=_open_live_component("cnc", cfg, geometry, motion, echo=echo),
+                       head=_open_live_component("head", cfg, geometry, motion, echo=echo))
 
 
 def _connect_live_devices(devices: LiveDevices) -> None:
@@ -426,6 +466,14 @@ def _connect_live_devices(devices: LiveDevices) -> None:
         try:
             device.connect()
         except Exception as exc:
+            if device is devices.servo:
+                print(f"警告：{label} 连接失败：{exc}；未自动调整针距，请人工核对。")
+                try:
+                    device.close()
+                except Exception as close_exc:
+                    print(f"警告：关闭伺服失败：{close_exc}")
+                devices.servo = UnavailableDevice(label, exc)
+                continue
             # 串口/网卡打不开是操作员最可能遇到的失败；不该让他看到 Python 堆栈。
             raise RuntimeError(f"{label} 连接失败：{exc}") from exc
 
@@ -445,10 +493,11 @@ def _close_live_devices(devices: LiveDevices) -> list[str]:
                 devices.head.valve(which, False)
             except Exception as exc:
                 failures.append(f"关闭 {which} 阀失败：{exc}")
-    try:
-        devices.servo.disable()
-    except Exception as exc:
-        failures.append(f"伺服卸使能失败：{exc}")
+    if getattr(devices.servo, "connected", True):
+        try:
+            devices.servo.disable()
+        except Exception as exc:
+            failures.append(f"伺服卸使能失败：{exc}")
     for name, device in (("滑台", devices.head), ("三维模组", devices.cnc),
                          ("伺服", devices.servo)):
         try:
@@ -483,6 +532,7 @@ def _execute_live_job(cfg: dict, row: PresetSpec, motion: HeadMotion, scan_z: fl
                               scan_z_mm=scan_z, operator_confirmed=True, z_datum=datum,
                               valve_delay_s=cfg["cycle"]["valve_delay_ms"] / 1000,
                               confirm_next=gate.wait_for_ready,
+                              servo_required=False, warning=lambda message: print(f"警告：{message}"),
                               progress=reporter)
 
     def confirm_next_row(completed_rows: int, cancel: threading.Event) -> bool:
@@ -578,7 +628,7 @@ def run_live(config_path: Path, confirmed: bool,
               f"滑台软件读数={devices.head.position_mm():.3f} mm；"
               f"预期安全高度 Z={scan_z:g} mm，对刀点 X={datum[0]:g} Z={datum[1]:g} mm。"
               f"读数不能证明机械零位。")
-        if not _prepare_live_zeros(devices.servo, devices.head, menu=menu):
+        if not _prepare_live_zeros(devices.servo, devices.head, menu=menu, servo_required=False):
             print("已取消，未开始自动植入。")
             return 1
         return _execute_live_job(cfg, row, motion, scan_z, plan, devices, datum=datum,

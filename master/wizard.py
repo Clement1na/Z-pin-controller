@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 from master.devices import list_nics, list_serial_ports, rank_nics, rank_serial_ports
@@ -277,13 +278,21 @@ def _default_text(value):
 
 
 # ------------------------------------------------------------------ 开启确认
-def confirm_zero_state(w: Wizard, servo, head, prepare_zeros) -> bool:
+def confirm_zero_state(w: Wizard, servo, head, prepare_zeros, *, servo_required=True) -> bool:
     """开机确认：零点不满足就转手动模式，满足则只需一句确认。
 
     注意断电重启后 connect() 会把伺服逻辑零点清空，所以正常一次开机必然
     要进手动模式——这一步不是走过场。
     """
     w.say("=== 开启确认 ===")
+    if not servo_required:
+        w.say(f"滑台当前软件读数 {head.position_mm():.3f} mm（待机应为 0 mm）。")
+        if not servo.connected or servo.origin_count is None:
+            w.warn("伺服未连接或尚未设零，未自动调整针距；请人工核对当前机械针距。")
+        if head.zero_confirmed:
+            return w.ask_yes_no("滑台仍在已确认的待机零点位置？", default=True)
+        w.warn("滑台还没有确认待机软件零位——进入手动控制模式。")
+        return prepare_zeros(servo, head)
     w.say(f"滑台当前软件读数 {head.position_mm():.3f} mm（待机应为 0 mm）；"
           f"伺服相对本次连接初始读数 {servo.setup_offset_mm:+.3f} mm（不是机械基准）。")
     if servo.origin_count is not None and head.zero_confirmed:
@@ -375,8 +384,9 @@ def confirm_assertions(w: Wizard) -> None:
 def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapters=None,
                      list_ports=None, results_dir=None, input_fn=None,
                      output=None, debug=False, profile_store=None,
-                     profile_selection=None, menu=None, command_reader=None, job_source=None) -> int:
-    """交互式实机流程：环境 → 作业 → 连接 → 零点 → 对刀 → 确认 → 运行。
+                     profile_selection=None, menu=None, command_reader=None, job_source=None,
+                     prepared_config=None) -> int:
+    """交互式实机流程：共用接口配置 → 作业 → 连接 → 零点 → 对刀 → 确认 → 运行。
 
     `menu` 与 `command_reader` 是给图形界面的两个注入点：安全设置菜单和急停指令
     在这里各有一次**绕过 `wizard` 参数**的直接调用（下面 `_prepare_live_zeros` 与
@@ -392,26 +402,31 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
     local_path = local_path_for(config_path)
     geometry = cli._known_geometry()
     source = job_source or cli.PresetJobSource()
-    cfg = load_merged(config_path)
-    if profile_store is not None and profile_selection:
-        cfg = profile_store.compose(config_path,
-                                    machine=profile_selection.get("machine"),
-                                    custom=profile_selection.get("custom"))
     devices = None
     try:
-        env = collect_environment(w, cfg, find_adapters=find_adapters,
-                                  list_ports=list_ports)
+        if prepared_config is None:
+            from master.interfaces import prepare_interfaces
+            cfg = prepare_interfaces(config_path, w, store=profile_store,
+                                     selection=profile_selection, find_adapters=find_adapters,
+                                     list_ports=list_ports)
+        else:
+            cfg = deepcopy(prepared_config)
+        env = {section: dict(cfg.get(section, {})) for section in ("servo", "cnc3d", "head")}
+        for key, axis in (("x_max", "X"), ("y_max", "Y"), ("z_max", "Z")):
+            value = env["cnc3d"].get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                env["cnc3d"][key] = _ask_limit(w, f"CNC {axis} 软限位上限 mm", None)
         row, _ = collect_preset(w, geometry, defaults={**cfg.get("job", {}), **(job_overrides or {})})
         row = source.build(cfg, {**preset_values(row), **(job_overrides or {})})
         plan = source.plan(row, geometry)
         env = _reconcile_limits(w, env, plan)
         motion = _build_motion(row)
         # 先落盘一次：即使后面在零点或对刀处中止，操作员选的端口/网卡也留下来了。
-        write_local(local_path, {**_local_sections(env, motion), "job": preset_values(row)})
-        w.say(f"已写入 {local_path}（此时还没有 scan_z_mm）")
-
         _apply(cfg, env)
-        cfg.setdefault("head", {}).update(_head_window(motion))
+        _apply(cfg, _local_sections(env, motion))
+        cfg["job"] = preset_values(row)
+        write_local(local_path, cfg)
+        w.say(f"已保存接口与作业参数到 {local_path}（安全高度待本次实机确认）")
         echo = cli._make_echo(debug)
         devices = cli._open_live_devices(cfg, geometry, motion, echo=echo)
         cli._connect_live_devices(devices)
@@ -419,19 +434,21 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
               f"滑台软件读数={devices.head.position_mm():.3f} mm。")
         if not confirm_zero_state(w, devices.servo, devices.head,
                                   lambda servo, head: cli._prepare_live_zeros(
-                                      servo, head, menu=menu)):
+                                      servo, head, menu=menu or w, servo_required=False),
+                                  servo_required=False):
             w.warn("未完成零点确认，未开始自动植入。")
             return 1
         datum = wait_for_work_datum(w, devices.cnc)
         scan_z = wait_for_safe_height(w, devices.cnc, datum, plan)
         confirm_assertions(w)
-        write_local(local_path, {**_local_sections(env, motion, scan_z), "job": preset_values(row)})
+        _apply(cfg, _local_sections(env, motion, scan_z))
+        write_local(local_path, cfg)
         w.say(f"已写入 {local_path}（含 scan_z_mm={scan_z:g} mm）")
         if profile_store is not None and profile_selection:
             machine = profile_selection.get("machine")
             if machine:
                 profile_store.save("machines", machine,
-                                   {**_local_sections(env, motion, scan_z), "job": preset_values(row)})
+                                   {section: values for section, values in cfg.items() if section != "custom"})
                 w.say(f"已同步保存机器配置 {machine}。")
 
         # 用写出的文件重新校验一遍：写出器的 bug 必须在这里暴露，而不是在运动中途。
@@ -496,7 +513,7 @@ def _local_sections(env: dict, motion: HeadMotion, scan_z_mm: float | None = Non
     if scan_z_mm is not None:
         cnc3d["scan_z_mm"] = scan_z_mm
     return {
-        "servo": {"adapter": env["servo"]["adapter"]},
+        "servo": {"adapter": env["servo"].get("adapter", "")},
         "cnc3d": cnc3d,
         "head": {"port": env["head"]["port"], **_head_window(motion)},
         "cycle": {"upper_release_after_retract": True},
@@ -513,7 +530,7 @@ def _check_consistency(cfg_built: dict, cfg_validated: dict) -> None:
     否则跑的就不是刚对好刀的那台机器——写出器的 bug 必须在这里暴露。
     """
     for section, key in (("servo", "adapter"), ("cnc3d", "port"), ("head", "port")):
-        if cfg_built[section][key] != cfg_validated[section][key]:
+        if cfg_built.get(section, {}).get(key, "") != cfg_validated.get(section, {}).get(key, ""):
             raise RuntimeError(
                 f"写出的配置 [{section}] {key} 与已连接设备不一致，已中止")
 

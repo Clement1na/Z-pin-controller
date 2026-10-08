@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import queue
+from copy import deepcopy
 import threading
 import tkinter as tk
 from tkinter import ttk
@@ -50,7 +51,8 @@ class _CustomSession:
             controller = self.factory(**self.options, cancel_event=self.cancel_event)
             head = controller.cfg.get("head", {})
             self.results.put(("ready", {"values": dict(controller.values), "window": {
-                key: head.get(key) for key in ("work_min_mm", "work_max_mm", "standby_mm", "datum_confirmed")}}, None))
+                key: head.get(key) for key in ("work_min_mm", "work_max_mm", "standby_mm", "datum_confirmed")},
+                "warnings": list(controller.warnings)}, None))
             while not (self.close_event.is_set() or self.cancel_event.is_set()):
                 try:
                     action, args, values = self.requests.get(timeout=0.05)
@@ -84,14 +86,16 @@ class CustomPage(tk.Toplevel):
     """Construct on Tk thread, then pass ``page.run`` to MainWindow._start."""
 
     def __init__(self, root, *, store, selection, config_path, debug=False,
-                 menu=None, controller_factory=None):
+                 menu=None, controller_factory=None, prepared_config=None,
+                 on_configuration_changed=None):
         super().__init__(root)
         self.title("Z-pin 自定义控制（实机）")
         self.transient(root)
         self.menu = menu
+        self._on_configuration_changed = on_configuration_changed
         self._session = _CustomSession(controller_factory or _controller_factory, dict(
             store=store, selection=dict(selection), config_path=config_path,
-            debug=debug, menu=menu))
+            debug=debug, menu=menu, prepared_config=deepcopy(prepared_config)))
         self._busy = True
         self._closing = False
         self._buttons = []
@@ -165,13 +169,15 @@ class CustomPage(tk.Toplevel):
             self._button(cnc, label, action)
 
         config = self._group(body, "参数 / 配置", 1, 1)
-        self._button(config, "按当前参数植入一次", "inject_once", self._all_values)
+        self._button(config, "按当前参数植入一次", "inject_once", self._injection_values)
         self._entry(config, "配置名称", self.name)
         self._button(config, "保存当前参数", "save", lambda: (self._name(), self._all_values()))
         self._button(config, "加载配置", "load", lambda: (self._name(),))
         self._button(config, "列出配置", "names")
         self.names_label = ttk.Label(config, text="", wraplength=260)
         self.names_label.pack(anchor="w")
+        self.warnings_label = ttk.Label(config, text="", wraplength=260, foreground="#b00020")
+        self.warnings_label.pack(anchor="w", pady=4)
 
         controls = self._group(body, "会话", 1, 2)
         ttk.Button(controls, text="急停并结束会话", command=self.close).pack(fill="x", pady=2)
@@ -185,6 +191,9 @@ class CustomPage(tk.Toplevel):
     def _all_values(self):
         return {key: self._number(key, **({"minimum": 0} if key in (
             "needle_pitch_mm", "travel_mm") else {})) for key in self.values}
+
+    def _injection_values(self):
+        return {key: self._number(key, minimum=0) for key in ("needle_pitch_mm", "travel_mm")}
 
     def _name(self):
         name = self.name.get().strip()
@@ -233,6 +242,8 @@ class CustomPage(tk.Toplevel):
             if error is not None:
                 self._note(f"{label}失败：{error}", error=True)
             else:
+                if action in ("save", "load") and self._on_configuration_changed is not None:
+                    self._on_configuration_changed()
                 loaded = value.get("values", {}) if action == "ready" else value
                 if action in ("ready", "load") and isinstance(loaded, dict):
                     for key, variable in self.values.items():
@@ -242,7 +253,12 @@ class CustomPage(tk.Toplevel):
                     window = value["window"]
                     def mm(key):
                         number = window.get(key)
-                        return "未设置" if number is None else f"{number:g} mm"
+                        if number is None:
+                            return "未设置"
+                        try:
+                            return f"{float(number):g} mm"
+                        except (TypeError, ValueError):
+                            return f"无效（{number}）"
                     self.window_label.configure(text=(
                         f"工作窗口：{mm('work_min_mm')} 至 {mm('work_max_mm')}\n"
                         f"待机位：{mm('standby_mm')}；机械基准"
@@ -250,7 +266,10 @@ class CustomPage(tk.Toplevel):
                 if action == "names":
                     self.names_label.configure(text="、".join(map(str, value or [])) or "暂无配置")
                 if action == "ready":
-                    self._note("参数已加载；动作会连接设备并可能移动机构。")
+                    warnings = value.get("warnings", [])
+                    self.warnings_label.configure(text="\n".join(warnings))
+                    self._note("参数已加载；动作会连接设备并可能移动机构。"
+                               + (" 请先查看配置警告；各组件操作分别校验。" if warnings else ""))
                 elif action == "inject_once":
                     self._note("单次植入完成。请剪断针丝后再点击下一次植入；不会自动继续。")
                 else:

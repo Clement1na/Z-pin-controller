@@ -39,7 +39,7 @@ class Coordinator:
                  operator_confirmed: bool, z_datum: tuple[float, float] | None = None,
                  valve_delay_s: float = 0.5,
                  confirm_next: Callable[[int, int, threading.Event], bool] | None = None,
-                 progress=None):
+                 progress=None, servo_required: bool = True, warning=None):
         if not math.isfinite(scan_z_mm) or not math.isfinite(valve_delay_s) or valve_delay_s < 0:
             raise ValueError("scan_z_mm 和 valve_delay_s 必须是有限数，且延时不能为负")
         if z_datum is not None:
@@ -57,6 +57,8 @@ class Coordinator:
         self.valve_delay_s = valve_delay_s
         self.confirm_next = confirm_next
         self.progress = progress
+        self.servo_required = servo_required
+        self.warning = warning or print
         self.progress_errors: list[str] = []
         self.state = RunState.READY
         self.cancel_event = threading.Event()
@@ -91,9 +93,9 @@ class Coordinator:
             raise RuntimeError("作业前必须由操作员确认 CNC 工作零点并保证行程无障碍")
         for name, device in (("SV630N 伺服", self.servo), ("CNC 三维模组", self.cnc),
                              ("GX28 滑台", self.head)):
-            if not device.connected:
+            if not device.connected and (device is not self.servo or self.servo_required):
                 raise RuntimeError(f"{name} 未连接")
-        if self.servo.origin_count is None:
+        if self.servo_required and self.servo.origin_count is None:
             raise RuntimeError("伺服逻辑零位必须在机械靠紧位设置")
         if not self.head.zero_confirmed:
             raise RuntimeError("滑台软件零位必须在物理待机位确认")
@@ -106,7 +108,7 @@ class Coordinator:
             raise RuntimeError("滑台不在已确认的 standby_mm 待机位")
 
     def _check_single_ready(self) -> None:
-        """Validate the two devices needed by the manual one-shot action.
+        """Validate the components needed by the manual one-shot action.
 
         A one-shot injection deliberately leaves the CNC where the operator put
         it.  Reusing ``_check_ready`` here would make the diagnostic action
@@ -116,14 +118,27 @@ class Coordinator:
         """
         for name, device in (("SV630N 伺服", self.servo),
                              ("GX28 滑台", self.head)):
-            if not device.connected:
+            if not device.connected and (device is not self.servo or self.servo_required):
                 raise RuntimeError(f"{name} 未连接")
-        if self.servo.origin_count is None:
+        if self.servo_required and self.servo.origin_count is None:
             raise RuntimeError("伺服逻辑零位必须先设置")
         if not self.head.zero_confirmed:
             raise RuntimeError("滑台软件零位必须先设置")
         if abs(self.head.position_mm() - self.motion.standby_mm) > 0.05:
             raise RuntimeError("单次注入前滑台必须位于 standby_mm 待机位")
+
+    def _position_servo(self, target_mm) -> None:
+        if self.servo_required:
+            self.servo.move_mm(target_mm)
+            return
+        try:
+            if not self.servo.connected:
+                raise RuntimeError("未连接")
+            if self.servo.origin_count is None:
+                raise RuntimeError("尚未设零")
+            self.servo.move_mm(target_mm)
+        except Exception as exc:
+            self.warning(f"伺服未完成针距调整：{exc}；按当前机械针距继续，请人工核对。")
 
     def request_stop(self) -> None:
         """Callable from another thread while a device method is waiting."""
@@ -131,9 +146,11 @@ class Coordinator:
             if self.cancel_event.is_set():
                 return
             self.cancel_event.set()
-            for name, action in (("滑台急停", self.head.stop),
-                                 ("CNC 暂停", self.cnc.hold),
-                                 ("伺服释放", self.servo.disable)):
+            for name, device, action in (("滑台急停", self.head, self.head.stop),
+                                         ("CNC 暂停", self.cnc, self.cnc.hold),
+                                         ("伺服释放", self.servo, self.servo.disable)):
+                if not device.connected:
+                    continue
                 try:
                     action()
                 except Exception as exc:
@@ -221,7 +238,7 @@ class Coordinator:
         self.state = RunState.RUNNING
         try:
             self._check_cancel()
-            self.servo.move_mm(plan.servo_target_mm)
+            self._position_servo(plan.servo_target_mm)
             self._check_cancel()
             while True:
                 self._run_one_row(plan, completed_rows, total)
@@ -261,7 +278,7 @@ class Coordinator:
 
         This is the manual/debug path.  It uses the selected plan only for the
         servo expansion target and the head stroke; it never calls ``cnc.move_to``
-        and does not require a CNC work datum.
+        and does not require a CNC work datum. The servo can be optional.
         """
         if self.state is not RunState.READY:
             raise RuntimeError("总控不能重复运行，也不能在停止后恢复")
@@ -272,7 +289,7 @@ class Coordinator:
         self.state = RunState.RUNNING
         try:
             self._check_cancel()
-            self.servo.move_mm(plan.servo_target_mm)
+            self._position_servo(plan.servo_target_mm)
             self._check_cancel()
             self._cycle_one()
             self._completed = 1

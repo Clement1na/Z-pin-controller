@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from copy import deepcopy
 import os
 import sys
 import threading
@@ -67,16 +68,18 @@ def _load_config(store, selection, config_path):
 
 class CustomController:
     def __init__(self, *, store, selection, config_path, debug=False,
-                 device_factory=None, cancel_event=None, menu=None):
+                 device_factory=None, cancel_event=None, menu=None, prepared_config=None):
         self.store, self.selection = store, selection
-        self.cfg = _load_config(store, selection, config_path)
+        self.cfg = (deepcopy(prepared_config) if prepared_config is not None
+                    else _load_config(store, selection, config_path))
         self.menu, self.debug = menu, debug
-        sv = self.cfg.get("servo", {})
-        self.geometry = MachineGeometry(5, 10.0, float(sv.get("max_expansion_mm", 10.0)),
-                                        float(sv.get("lead_mm", 13.3333333)))
-        self.values = custom_from_sections(self.cfg)
-        self._validate(self.values)
-        self.devices = None
+        from master.master import LiveDevices, UnavailableDevice, _known_geometry
+        self.geometry = _known_geometry()
+        self.warnings = []
+        self.values = self._initial_values(self.cfg)
+        self.devices = LiveDevices(*(UnavailableDevice(name, "尚未连接")
+                                     for name in ("伺服", "CNC", "滑台")))
+        self._constructed = set()
         self._factory = device_factory
         self.cancel_event = cancel_event if cancel_event is not None else threading.Event()
         self._closed = False
@@ -88,16 +91,22 @@ class CustomController:
             self._monitor = threading.Thread(target=self._watch_stop, daemon=True)
             self._monitor.start()
 
-    def _validate(self, values):
-        servo_target_from_pitch(values["needle_pitch_mm"], self.geometry)
-        hd = self.cfg.get("head", {})
-        if all(k in hd for k in ("standby_mm", "work_min_mm")):
-            insertion_from_travel(values["travel_mm"], hd["standby_mm"], hd["work_min_mm"])
-        cn = self.cfg.get("cnc3d", {})
-        for axis in "xyz":
-            value = values[f"{axis}_mm"]
-            if (axis in "xy" and value < 0) or value > cn.get(f"{axis}_max", math.inf):
-                raise ValueError(f"CNC {axis.upper()} 目标超出工作范围")
+    def _initial_values(self, cfg):
+        """Recover each invalid UI field independently; movement validates its own limits."""
+        section = cfg.get("custom", {})
+        if not isinstance(section, dict):
+            self._warn("[custom] 参数表无效；使用默认值，其他组件仍可操作")
+            section = {}
+        values = dict(_DEFAULTS)
+        for key in values:
+            if key not in section:
+                continue
+            try:
+                parsed = custom_from_sections({"custom": {key: section[key]}})
+                values[key] = parsed[key]
+            except (ValueError, TypeError) as exc:
+                self._warn(f"自定义参数 {key} 无效（{exc}）；已使用默认值 {values[key]:g}")
+        return values
 
     def update(self, values):
         if not isinstance(values, dict) or set(values) - set(_DEFAULTS):
@@ -105,16 +114,18 @@ class CustomController:
         candidate = dict(self.values)
         candidate.update(values)
         candidate = custom_from_sections({"custom": candidate})
-        self._validate(candidate)
         self.values = candidate
         return dict(candidate)
 
-    def _motion(self):
+    def _motion(self, *, standby_only=False):
         hd = self.cfg.get("head", {})
         if hd.get("datum_confirmed") is not True or not all(k in hd for k in ("standby_mm", "work_min_mm", "work_max_mm")):
             raise RuntimeError("请先在机器配置中确认滑台待机位与安全工作窗口")
-        return HeadMotion(hd["standby_mm"], insertion_from_travel(self.values["travel_mm"],
-                          hd["standby_mm"], hd["work_min_mm"]), hd["work_min_mm"],
+        standby = _finite(hd["standby_mm"], "待机位置")
+        work_min = _finite(hd["work_min_mm"], "工作下界")
+        travel = standby - work_min if standby_only else self.values["travel_mm"]
+        return HeadMotion(standby, insertion_from_travel(travel,
+                          standby, work_min), work_min,
                           hd["work_max_mm"], True)
 
     def _check(self):
@@ -123,18 +134,38 @@ class CustomController:
 
     def _device(self, name):
         self._check()
-        if self.devices is None:
-            if self._factory is None:
-                from master.master import _open_live_devices, _make_echo
-                self.devices = _open_live_devices(self.cfg, self.geometry, None, echo=_make_echo(self.debug))
-            else:
+        if name not in self._constructed:
+            if self._factory is not None:
                 self.devices = self._factory(cfg=self.cfg, geometry=self.geometry, motion=None, debug=self.debug)
-            for device in (self.devices.servo, self.devices.cnc, self.devices.head):
+                self._constructed.update(("servo", "cnc", "head"))
+                for device in (self.devices.servo, self.devices.cnc, self.devices.head):
+                    device.cancel_event = self.cancel_event
+            else:
+                from master.master import _open_live_component, _make_echo
+                try:
+                    device = _open_live_component(name, self.cfg, self.geometry, None,
+                                                  echo=_make_echo(self.debug))
+                except Exception as exc:
+                    raise RuntimeError(f"{name} 配置或初始化失败：{exc}") from exc
                 device.cancel_event = self.cancel_event
+                setattr(self.devices, name, device)
+                self._constructed.add(name)
         device = getattr(self.devices, name)
         self._check()
         if not device.connected:
-            device.connect()
+            try:
+                device.connect()
+            except Exception as exc:
+                from master.master import UnavailableDevice
+                try:
+                    device.close()
+                except Exception:
+                    pass
+                unavailable = UnavailableDevice(name, str(exc))
+                unavailable.cancel_event = self.cancel_event
+                setattr(self.devices, name, unavailable)
+                self._constructed.discard(name)
+                raise RuntimeError(f"{name} 连接失败：{exc}") from exc
         if self.cancel_event.is_set():
             self._safe_stop(force=True)
         self._check()
@@ -176,7 +207,7 @@ class CustomController:
     def head_stop(self): return self._call("head", "stop")
 
     def head_standby(self):
-        motion = self._motion()
+        motion = self._motion(standby_only=True)
         head = self._device("head")
         head.motion = motion
         self._check()
@@ -193,6 +224,14 @@ class CustomController:
 
     def cnc_move_to(self, x_mm=None, y_mm=None, z_mm=None):
         self.update({f"{axis}_mm": value for axis, value in zip("xyz", (x_mm, y_mm, z_mm)) if value is not None})
+        cn = self.cfg.get("cnc3d", {})
+        for axis in "xyz":
+            if not isinstance(cn, dict) or f"{axis}_max" not in cn:
+                raise RuntimeError(f"请先设置 CNC {axis.upper()} 安全上限")
+            limit = _finite(cn[f"{axis}_max"], f"CNC {axis.upper()} 上限")
+            value = self.values[f"{axis}_mm"]
+            if limit <= 0 or (axis in "xy" and value < 0) or value > limit:
+                raise ValueError(f"CNC {axis.upper()} 目标超出工作范围")
         return self._call("cnc", "move_to", *(self.values[f"{axis}_mm"] for axis in "xyz"))
 
     def cnc_home(self): return self._call("cnc", "home")
@@ -203,15 +242,22 @@ class CustomController:
         if self.cfg.get("cycle", {}).get("upper_release_after_retract") is not True:
             raise RuntimeError("单次注入前必须确认回针后释放上夹持阀的时序")
         motion = self._motion()  # New motion and coordinator for every button press.
-        servo, head = self._device("servo"), self._device("head")
-        if servo.origin_count is None or not head.zero_confirmed:
-            raise RuntimeError("单次注入前必须明确设置伺服和滑台机械零位")
+        head = self._device("head")
+        if not head.zero_confirmed:
+            raise RuntimeError("单次注入前必须明确设置滑台机械零位")
+        try:
+            servo = self._device("servo")
+        except Exception as exc:
+            self._check()  # A real stop must never be mistaken for optional hardware.
+            self._warn(f"伺服不可用：{exc}；本次保持当前针距，仅执行滑台与气阀动作")
+            servo = self.devices.servo
         head.motion = motion
         pitch = self.values["needle_pitch_mm"]
         plan = RowPlan(pitch, servo_target_from_pitch(pitch, self.geometry), 0.0,
                        (Placement(0.0, 0.0, ()),))
         coordinator = Coordinator(servo, self.devices.cnc, head, motion, scan_z_mm=0.0,
                                   operator_confirmed=True,
+                                  servo_required=False, warning=self._warn,
                                   valve_delay_s=self.cfg.get("cycle", {}).get("valve_delay_ms", 500) / 1000)
         coordinator.cancel_event = self.cancel_event
         for device in (servo, self.devices.cnc, head):
@@ -226,7 +272,6 @@ class CustomController:
     def names(self): return self.store.list_names("custom")
 
     def save(self, name):
-        self._validate(self.values)
         path = self.store.save("custom", name, custom_sections(self.values))
         self.store.save_selection(machine=self.selection.get("machine"), custom=name)
         self.selection["custom"] = name
@@ -234,15 +279,17 @@ class CustomController:
 
     def load(self, name):
         candidate = custom_from_sections(self.store.load("custom", name))
-        self._validate(candidate)
         self.store.save_selection(machine=self.selection.get("machine"), custom=name)
         self.values = candidate
         self.selection["custom"] = name
         return dict(candidate)
 
     def _warn(self, message):
+        self.warnings.append(message)
         if self.menu is not None:
             self.menu.warn(message)
+        else:
+            print(f"警告：{message}")
 
     def _safe_stop(self, *, force=False):
         if self.devices is None:
@@ -327,12 +374,13 @@ def _run_hardware_action(controller, action, read_stop=None):
 
 
 def run_custom_menu(*, store, selection, config_path, debug=False, menu=None,
-                    device_factory=None, command_reader=None, read_stop=None):
+                    device_factory=None, command_reader=None, read_stop=None, prepared_config=None):
     if menu is None:
         from master.menu import make_menu
         menu = make_menu()
     controller = CustomController(store=store, selection=selection, config_path=config_path,
         debug=debug, menu=menu, device_factory=device_factory,
+        prepared_config=prepared_config,
         cancel_event=command_reader.cancel_event if command_reader is not None else threading.Event())
     if read_stop is None and command_reader is None:
         read_stop = _terminal_stop_reader()
