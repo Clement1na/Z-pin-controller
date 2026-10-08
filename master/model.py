@@ -9,8 +9,9 @@ from dataclasses import dataclass
 #: directly below it, so a mistyped depth is a collision, not a bad sample.
 MAX_DEPTH_MM = 3.0
 
-#: Sanity bound on the fixturing angle; the process only uses 0/+/-15/+/-30.
-MAX_ANGLE_DEG = 45.0
+#: Supported fixture angles, shared by all entry points.
+PRESET_ANGLES = (0, 15, 30)
+MAX_ANGLE_DEG = 30.0
 
 #: Axial length of the reinforced zone the preset covers. The operator's own
 #: wording for it is "20 mm", so it is a constant here rather than an input.
@@ -53,11 +54,9 @@ class PresetSpec:
     That extra stroke's second needle lands at ``(count-1) * spacing + 10``,
     outside the zone -- the normal overhang case, recorded and cut off later.
 
-    The needles stay vertical; the tube is fixtured at ``angle_deg``. That is how
-    +/-15 and +/-30 are achieved. ``angle_deg`` is **signed**: a positive angle
-    means the tube surface rises towards +x, so the work height tracked by the CNC
-    climbs with x. A negative angle is the mirror case and walks the work height
-    back down -- the two signs are genuinely different machine situations.
+    The needles stay vertical; the fixture angle is one of 0, 15 and 30 degrees.
+    The tube surface rises towards +x for a positive angle, so the CNC work
+    height climbs with x.
     """
 
     angle_deg: float
@@ -67,8 +66,8 @@ class PresetSpec:
     def __post_init__(self) -> None:
         _finite("angle_deg", self.angle_deg)
         _positive("depth_mm", self.depth_mm)
-        if abs(self.angle_deg) > MAX_ANGLE_DEG:
-            raise ValueError(f"angle_deg 必须在 ±{MAX_ANGLE_DEG:g} 度以内")
+        if self.angle_deg not in PRESET_ANGLES:
+            raise ValueError("angle_deg 只支持 0、15、30 度")
         if self.depth_mm > MAX_DEPTH_MM:
             raise ValueError(
                 f"depth_mm 沿垂直管面量，不得超过 {MAX_DEPTH_MM:g} mm；"

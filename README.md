@@ -16,8 +16,8 @@
 
 10根预设不要求20 mm端点。7/15根补针时第二根针会落在30 mm处，记录中保留该区外落点；需保证余料和夹具允许，再人工切除。
 
-针竖直，管子架斜。θ带符号（±45°内），正值表示管面朝+X上升。排内工作高度按 `z=z0+(x-x0)*tanθ` 跟随；安全高度不得低于整排最高工作点。
-深度沿垂直管面量，必须大于0且不超过3 mm；滑台行程为 `depth/cosθ`。两根针的针长差为 `10*tanθ`，正负角需要匹配的针组。
+针竖直，管子架斜。θ仅支持0°、15°、30°，正角表示管面朝+X上升。排内工作高度按 `z=z0+(x-x0)*tanθ` 跟随；安全高度不得低于整排最高工作点。
+深度沿垂直管面量，必须大于0且不超过3 mm；滑台行程为 `depth/cosθ`。两根针的针长差为 `10*tanθ`，不同架角需要匹配的针组。
 对刀以已装两针中的左针为排头。每次退针并释放B阀后人工剪丝，按回车或界面「继续」才进入下一落点。一排完成抬至安全高度回排头，人工转管后继续；`D`表示排间正常收工，`!`请求急停。
 
 ## 完全自定义
@@ -42,7 +42,7 @@ $env:PYTHONNOUSERSITE = '1'
 python -B master/gui_main.py
 python -B master/master.py
 python -B master/master.py --smoke-test
-python -B master/master.py --simulate --count 10 --angle -30 --depth 3
+python -B master/master.py --simulate --count 10 --angle 30 --depth 3
 python -B master/master.py --live
 ```
 

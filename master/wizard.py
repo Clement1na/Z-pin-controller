@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 from master.devices import list_nics, list_serial_ports, rank_nics, rank_serial_ports
-from master.model import MAX_ANGLE_DEG, MAX_DEPTH_MM, PRESET_COUNTS, HeadMotion, PresetSpec
+from master.model import MAX_DEPTH_MM, PRESET_ANGLES, PRESET_COUNTS, HeadMotion, PresetSpec
 from master.planner import highest_work_z_mm, plan_preset_row
 
 # 对应固件 insert_head.ino 的 WORK_MIN_MM，是机械行程不是工艺参数，不问操作员。
@@ -244,7 +244,7 @@ def _ask_limit(w: Wizard, prompt: str, current) -> float:
 
 # ------------------------------------------------------------------ 作业
 def collect_preset(w: Wizard, geometry, *, defaults=None):
-    """Collect density, signed fixture angle and perpendicular depth each run."""
+    """Collect density, supported fixture angle and perpendicular depth each run."""
     from master.master import _print_plan
     defaults = defaults or {}
     w.say("=== 预设任务：20 mm 强化区，仅装最右两针，针距固定 10 mm，伺服保持零位 ===")
@@ -252,8 +252,9 @@ def collect_preset(w: Wizard, geometry, *, defaults=None):
     while True:
         count = int(w.choose("每排植入根数", tuple((str(n), f"{n} 根") for n in PRESET_COUNTS),
                              default=str(defaults.get("count", 7)) if defaults.get("count", 7) in PRESET_COUNTS else "7"))
-        angle = w.ask_float("架子角度 θ（度，带符号）", minimum=-MAX_ANGLE_DEG,
-                            maximum=MAX_ANGLE_DEG, default=_default_text(defaults.get("angle_deg")), unit="°")
+        default_angle = defaults.get("angle_deg", 15)
+        angle = float(w.choose("架子角度 θ", tuple((str(a), f"{a}°") for a in PRESET_ANGLES),
+                               default=_default_text(default_angle) if default_angle in PRESET_ANGLES else "15"))
         depth = w.ask_float(f"植入深度 mm（垂直管面，不超过 {MAX_DEPTH_MM:g}）",
                             minimum=MIN_DIMENSION_MM, maximum=MAX_DEPTH_MM,
                             default=_default_text(defaults.get("depth_mm")),

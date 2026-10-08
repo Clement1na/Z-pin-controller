@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT))
 
 from master.coordinator import Coordinator, RunState
 from master.local_config import load_merged, local_path_for, write_local
-from master.model import HeadMotion, MachineGeometry, PresetSpec
+from master.model import PRESET_ANGLES, HeadMotion, MachineGeometry, PresetSpec
 from master.operator_gate import OperatorGate
 from master.planner import highest_work_z_mm, plan_preset_row, work_z_mm
 from master.simulated import SimulationRig
@@ -595,8 +595,8 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--smoke-test", action="store_true", help="run full reference job without hardware")
     mode.add_argument("--simulate", action="store_true", help="run a specified job without hardware")
     mode.add_argument("--live", action="store_true", help="connect to actual machine after preflight")
-    parser.add_argument("--angle", type=float,
-                        help="架子角度 θ（度，带符号；正值 = 管面朝 +x 上升）")
+    parser.add_argument("--angle", type=float, choices=PRESET_ANGLES,
+                        help="架子角度 θ（0、15、30 度；管面朝 +x 上升）")
     parser.add_argument("--count", type=int, help="每排植入根数（菜单预设 7/10/15）")
     parser.add_argument("--depth", type=float, help="沿垂直管面的植入深度 mm（1-3）")
     parser.add_argument("--datum-x", type=float, help="对刀点的 CNC X mm（非交互实机路径必填）")

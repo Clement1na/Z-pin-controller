@@ -175,7 +175,7 @@ CNC 每次移动都会每 0.1 秒发一次 `?` 查询状态，一秒 10 行一�
 
 ```
 ZpinControl.exe --smoke-test                          # 参考作业全流程，不接硬件
-ZpinControl.exe --simulate --angle -30 --count 10 --depth 3   # 指定作业仿真
+ZpinControl.exe --simulate --angle 30 --count 10 --depth 3   # 指定作业仿真
 ZpinControl.exe --live --confirm-datum --datum-x 0 --datum-z -5 --debug    # 实机
 ```
 
