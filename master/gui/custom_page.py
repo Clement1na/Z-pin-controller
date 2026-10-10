@@ -9,6 +9,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from master.gui.menu import parse_float
+from master.coordinator import RunState
 
 _ACTION_LABELS = {
     "servo_pitch": "针距移动", "servo_enable": "伺服使能", "servo_set_zero": "伺服设零",
@@ -18,6 +19,7 @@ _ACTION_LABELS = {
     "valve": "气阀切换", "valves_off": "全部气阀关闭", "cnc_move_to": "CNC 移动",
     "cnc_home": "CNC 回原点", "cnc_unlock": "CNC 解锁", "cnc_position": "CNC 位置查询",
     "inject_once": "单次植入", "save": "配置保存", "load": "配置加载", "names": "配置列表查询",
+    "finish_cut": "剪丝后恢复待机",
 }
 
 
@@ -170,6 +172,7 @@ class CustomPage(tk.Toplevel):
 
         config = self._group(body, "参数 / 配置", 1, 1)
         self._button(config, "按当前参数植入一次", "inject_once", self._injection_values)
+        self._button(config, "剪丝完成，松上阀并恢复待机", "finish_cut")
         self._entry(config, "配置名称", self.name)
         self._button(config, "保存当前参数", "save", lambda: (self._name(), self._all_values()))
         self._button(config, "加载配置", "load", lambda: (self._name(),))
@@ -271,7 +274,12 @@ class CustomPage(tk.Toplevel):
                     self._note("参数已加载；动作会连接设备并可能移动机构。"
                                + (" 请先查看配置警告；各组件操作分别校验。" if warnings else ""))
                 elif action == "inject_once":
-                    self._note("单次植入完成。请剪断针丝后再点击下一次植入；不会自动继续。")
+                    if getattr(value, "state", None) is RunState.WAITING_OPERATOR:
+                        self._note("已抬高等待剪丝，上阀保持夹紧。剪完并让双手离开后，点击‘剪丝完成，松上阀并恢复待机’。")
+                    else:
+                        self._note("单次植入完成。请剪断针丝后再点击下一次植入；不会自动继续。")
+                elif action == "finish_cut":
+                    self._note("剪丝确认完成，上阀已松开，滑台已回待机位，可以开始下一次植入。")
                 else:
                     self._note(f"{label}完成" + (f"：{value}" if value is not None else ""))
             self._sync_buttons()

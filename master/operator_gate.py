@@ -8,8 +8,9 @@ from typing import TextIO
 
 
 class OperatorGate:
-    def __init__(self, *, output: TextIO | None = None):
+    def __init__(self, *, output: TextIO | None = None, cut_clearance_mm: float = 0.0):
         self.output = output if output is not None else sys.stdout
+        self.cut_clearance_mm = cut_clearance_mm
         self._lock = threading.Lock()
         self._ready = threading.Event()
         self._waiting = False
@@ -24,8 +25,11 @@ class OperatorGate:
         with self._lock:
             self._ready.clear()
             self._waiting = True
-        print(f"已完成 {completed}/{total} 次植入动作，GX28 已回待机点且上气阀 B 已排气。"
-              "请人工剪断已装金属丝并准备下一次植入；确认安全后按回车继续。"
+        status = (f"GX28 已额外上抬 {self.cut_clearance_mm:g} mm，电机保持使能，上气阀 B 保持夹紧。"
+                  "剪丝完成、双手离开后按回车，程序将松开 B 阀并让滑台下降回待机位。"
+                  if self.cut_clearance_mm else
+                  "GX28 已回待机点且上气阀 B 已排气。请人工剪断已装金属丝并准备下一次植入；确认安全后按回车继续。")
+        print(f"已完成 {completed}/{total} 次植入动作，" + status +
               "输入 ! 可停止。", file=self.output, flush=True)
         try:
             while not cancel.is_set():

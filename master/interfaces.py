@@ -67,7 +67,8 @@ def prepare_interfaces(config_path, menu, *, store=None, selection=None,
                        find_adapters=None, list_ports=None) -> dict:
     """Return and persist the full chosen configuration, with optional interfaces.
 
-    This step neither opens hardware nor asks for motion limits or calibration.
+    This step does not open hardware. It retains the shared cutting settings;
+    the live wizard asks for the lifting distance after touch-off.
     The returned snapshot can be passed unchanged into either execution branch.
     """
     config_path = Path(config_path)

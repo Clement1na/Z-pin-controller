@@ -106,8 +106,7 @@ class Coordinator:
             raise RuntimeError("作业前 CNC 必须位于已确认的 scan_z_mm 高度")
         if not math.isfinite(position[1]) or abs(position[1] - plan.placements[0].cnc_y_mm) > 0.05:
             raise RuntimeError("作业前 CNC Y 与对刀时确认的位置不一致；请重新对刀，抬刀时只调整 Z")
-        if abs(self.head.position_mm() - self.motion.standby_mm) > 0.05:
-            raise RuntimeError("滑台不在已确认的 standby_mm 待机位")
+        self._check_head_position()
 
     def _check_single_ready(self) -> None:
         """Validate the components needed by the manual one-shot action.
@@ -126,8 +125,25 @@ class Coordinator:
             raise RuntimeError("伺服逻辑零位必须先设置")
         if not self.head.zero_confirmed:
             raise RuntimeError("滑台软件零位必须先设置")
+        self._check_head_position()
+
+    def _check_head_position(self) -> None:
+        position = self.head.position_mm()
+        expected = (self.motion.standby_mm, self.motion.cut_position_mm)
+        if not math.isfinite(position) or all(abs(position - target) > 0.05 for target in expected):
+            raise RuntimeError("滑台不在已确认的对刀待机位或剪丝安全位置；请重新核实位置")
+
+    def _prepare_standby(self) -> None:
+        self._check_cancel()
+        self._check_head_position()
         if abs(self.head.position_mm() - self.motion.standby_mm) > 0.05:
-            raise RuntimeError("单次注入前滑台必须位于 standby_mm 待机位")
+            # The wizard leaves GX28 at the recorded cutting height. Restore
+            # the touch-off datum before the first insertion, with clamps open.
+            self.head.valve("a", False)
+            self.head.valve("b", False)
+            self._delay()
+            self.head.move_mm(self.motion.standby_mm)
+            self._check_cancel()
 
     def _position_servo(self, target_mm) -> None:
         if self.servo_required:
@@ -185,7 +201,23 @@ class Coordinator:
         self._delay()
         self.head.move_mm(self.motion.standby_mm)
         self._check_cancel()
+        if self.motion.cut_clearance_mm:
+            self.head.move_mm(self.motion.cut_position_mm)
+            self._check_cancel()
+        else:
+            self.head.valve("b", False)
+
+    def _finish_cut(self) -> None:
+        """Called only after cutting is confirmed; never lower on cancel or failure."""
+        self._check_cancel()
+        position = self.head.position_mm()
+        if (not self.head.zero_confirmed or not math.isfinite(position)
+                or abs(position-self.motion.cut_position_mm) > 0.05):
+            raise RuntimeError("剪丝等待位置或滑台零位已改变；未自动下降，请重新核实位置")
         self.head.valve("b", False)
+        self._delay()
+        self.head.move_mm(self.motion.standby_mm)
+        self._check_cancel()
 
     def _run_one_row(self, plan: RowPlan, row: int, total: int) -> None:
         """Walk the placement list once, incrementing ``self._completed``.
@@ -210,12 +242,14 @@ class Coordinator:
                 raise
             self._completed += 1
             self._notify("placement_finished", row, index, total, placement, ok=True, error=None)
-            if index + 1 < total:
+            if self.motion.cut_clearance_mm or index + 1 < total:
                 self.state = RunState.WAITING_OPERATOR
                 self._check_cancel()
                 if not self.confirm_next(index + 1, total, self.cancel_event):
                     raise _StopRequested()
                 self._check_cancel()
+                if self.motion.cut_clearance_mm:
+                    self._finish_cut()
                 self.state = RunState.RUNNING
 
     def run(self, plan: RowPlan, *, confirm_next_row=None) -> RunResult:
@@ -231,7 +265,7 @@ class Coordinator:
         if self.state is not RunState.READY:
             raise RuntimeError("总控不能重复运行，也不能在停止后恢复")
         total = len(plan.placements)
-        if total > 1 and self.confirm_next is None:
+        if (total > 1 or self.motion.cut_clearance_mm) and self.confirm_next is None:
             raise RuntimeError("剪丝并重新装丝后，每次进入下一落点都需要操作员确认")
         self._check_ready(plan)
         self._completed = 0
@@ -242,6 +276,7 @@ class Coordinator:
             self._check_cancel()
             self._position_servo(plan.servo_target_mm)
             self._check_cancel()
+            self._prepare_standby()
             while True:
                 self._run_one_row(plan, completed_rows, total)
                 completed_rows += 1
@@ -293,8 +328,12 @@ class Coordinator:
             self._check_cancel()
             self._position_servo(plan.servo_target_mm)
             self._check_cancel()
+            self._prepare_standby()
             self._cycle_one()
             self._completed = 1
+            if self.motion.cut_clearance_mm:
+                self.state = RunState.WAITING_OPERATOR
+                return RunResult(self.state, 1, 1, 0)
             self.state = RunState.COMPLETE
             return RunResult(self.state, 1, 1, 1)
         except _StopRequested:
@@ -311,3 +350,19 @@ class Coordinator:
             self.state = RunState.FAULT
             return RunResult(self.state, self._completed, 1, 0,
                              self._stop_reason(str(exc)))
+
+    def finish_single_cut(self) -> RunResult:
+        if self.state is not RunState.WAITING_OPERATOR or not self.motion.cut_clearance_mm:
+            raise RuntimeError("没有等待确认的单次剪丝动作")
+        try:
+            self._finish_cut()
+            self.state = RunState.COMPLETE
+            return RunResult(self.state, 1, 1, 1)
+        except _StopRequested:
+            self.request_stop()
+            self.state = RunState.STOPPED
+            return RunResult(self.state, 1, 1, 0, self._stop_reason("操作员请求停止"))
+        except Exception as exc:
+            self.request_stop()
+            self.state = RunState.FAULT
+            return RunResult(self.state, 1, 1, 0, self._stop_reason(str(exc)))

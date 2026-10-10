@@ -9,6 +9,16 @@ from dataclasses import dataclass
 #: directly below it, so a mistyped depth is a collision, not a bad sample.
 MAX_DEPTH_MM = 3.0
 
+# Extra GX28 lift confirmed by the operator for cutting the implanted wire.
+MAX_CUT_CLEARANCE_MM = 5.0
+
+
+def validate_cut_clearance_mm(value: float) -> float:
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or not 0 <= value <= MAX_CUT_CLEARANCE_MM):
+        raise ValueError("剪丝额外抬升距离必须在 0..5 mm 内")
+    return float(value)
+
 #: Supported fixture angles, shared by all entry points.
 PRESET_ANGLES = (0, 15, 30)
 MAX_ANGLE_DEG = 30.0
@@ -179,8 +189,10 @@ class HeadMotion:
     work_min_mm: float
     work_max_mm: float
     datum_confirmed: bool
+    cut_clearance_mm: float = 0.0
 
     def __post_init__(self) -> None:
+        validate_cut_clearance_mm(self.cut_clearance_mm)
         for name in ("standby_mm", "insertion_mm", "work_min_mm", "work_max_mm"):
             _finite(name, getattr(self, name))
         if not self.datum_confirmed:
@@ -191,6 +203,12 @@ class HeadMotion:
             raise ValueError("standby_mm 不在已确认的工作窗口内")
         if not self.work_min_mm <= self.insertion_mm < self.standby_mm:
             raise ValueError("insertion_mm 必须小于 standby_mm，且在已确认的工作窗口内")
+        if self.cut_position_mm > self.work_max_mm:
+            raise ValueError("剪丝抬升位置超出已确认的滑台工作窗口")
+
+    @property
+    def cut_position_mm(self) -> float:
+        return self.standby_mm + self.cut_clearance_mm
 
     @property
     def down_delta_mm(self) -> float:

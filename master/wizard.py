@@ -10,10 +10,11 @@ from __future__ import annotations
 import math
 import sys
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 from master.devices import list_nics, list_serial_ports, rank_nics, rank_serial_ports
-from master.model import MAX_DEPTH_MM, PRESET_ANGLES, PRESET_COUNTS, HeadMotion, PresetSpec
+from master.model import MAX_DEPTH_MM, MAX_CUT_CLEARANCE_MM, PRESET_ANGLES, PRESET_COUNTS, HeadMotion, PresetSpec, validate_cut_clearance_mm
 from master.planner import highest_work_z_mm, plan_preset_row
 
 # 对应固件 insert_head.ino 的 WORK_MIN_MM，是机械行程不是工艺参数，不问操作员。
@@ -352,6 +353,49 @@ def wait_for_safe_height(w: Wizard, cnc, datum, plan) -> float:
             return position[2]
 
 
+def prepare_head_for_touch_off(w: Wizard, head, motion: HeadMotion) -> bool:
+    """Reserve upward travel using the existing firmware's negative window."""
+    w.say("=== GX28 对刀准备 ===")
+    w.say("先保持针尖离开工件，确认滑台从当前零点向下 5 mm 无障碍、金属丝未被夹紧。"
+          "程序将滑台移到 -5 mm，再进行 CNC 对刀；不会重新设置滑台零点。")
+    if not w.ask_yes_no("确认下方有 5 mm 余量，允许 GX28 向下准备？", default=False):
+        return False
+    initial = head.position_mm()
+    if not head.zero_confirmed or not math.isfinite(initial) or abs(initial) > 0.05:
+        raise RuntimeError("GX28 对刀准备前必须在本次人工确认的 0 mm 位置；请重新核实零点")
+    head.valve("a", False)
+    head.valve("b", False)
+    head.motion = motion
+    head.move_mm(motion.standby_mm)
+    position = head.position_mm()
+    if not math.isfinite(position) or abs(position-motion.standby_mm) > 0.05:
+        raise RuntimeError("GX28 对刀准备位置回读不一致，未开始对刀")
+    w.say(f"GX28 已到 {position:g} mm；请在此位置进行 CNC 对刀。")
+    return True
+
+
+def lift_head_after_touch_off(w: Wizard, head, motion: HeadMotion) -> tuple[HeadMotion, float]:
+    position = head.position_mm()
+    if not head.zero_confirmed or not math.isfinite(position) or abs(position-motion.standby_mm) > 0.05:
+        raise RuntimeError("GX28 对刀时的位置已改变；请重新准备并对刀")
+    # Preserve the measured datum. Targets stay inside [-10, 0], so no new
+    # firmware commands or software zero change are needed.
+    distance = w.ask_float("对刀已记录。GX28 可动针头上升多少 mm？（0关闭剪丝抬升）",
+                           minimum=0, maximum=min(MAX_CUT_CLEARANCE_MM, -position),
+                           default=f"{min(motion.cut_clearance_mm, -position):g}")
+    lifted = replace(motion, standby_mm=position,
+                     insertion_mm=position+motion.down_delta_mm,
+                     cut_clearance_mm=distance)
+    head.motion = lifted
+    head.move_mm(lifted.cut_position_mm)
+    readback = head.position_mm()
+    if not math.isfinite(readback) or abs(readback-lifted.cut_position_mm) > 0.05:
+        raise RuntimeError("GX28 上升后位置回读不一致，未记录安全位置")
+    w.say(f"已记录 GX28 对刀位 {position:g} mm、上升 {distance:g} mm、剪丝安全位置 {readback:g} mm。"
+          "开始植入时先下降回对刀位；此位置与 CNC 排间 Z 安全高度分别记录。")
+    return lifted, readback
+
+
 def check_limits(plan, limits) -> None:
     """排程落点是否落在 CNC 软限位内；不满足则抛 ValueError。"""
     x_max, y_max, _ = limits
@@ -373,7 +417,7 @@ def confirm_assertions(w: Wizard) -> None:
     w.say("=== 最后确认（以下三项会写入本机配置，必须先在实机上核实）===")
     w.say("1. ESP32 已烧录本仓库的协议 2 固件（连接时会真实握手，填错会在连接时报错）。")
     w.say("2. 滑台可用下行窗口已在实机测过；本次滑台行程由 depth/cosθ 推导（见排程回显）。")
-    w.say("3. 上阀 B 退针后释放、切丝与供丝流程已确认。")
+    w.say("3. 剪丝与供丝流程已确认；启用剪丝抬升时，上阀 B 保持夹紧直到剪丝确认。")
     while True:
         if not w.ask("确认以上三项都已在实机核实，请按回车继续"):
             return
@@ -420,7 +464,7 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
         row = source.build(cfg, {**preset_values(row), **(job_overrides or {})})
         plan = source.plan(row, geometry)
         env = _reconcile_limits(w, env, plan)
-        motion = _build_motion(row)
+        motion = _build_motion(row, cfg.get("cycle", {}).get("cut_clearance_mm", 5.0))
         # 先落盘一次：即使后面在零点或对刀处中止，操作员选的端口/网卡也留下来了。
         _apply(cfg, env)
         _apply(cfg, _local_sections(env, motion))
@@ -432,18 +476,25 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
         cli._connect_live_devices(devices)
         w.say(f"连接后状态：CNC WPos={devices.cnc.position()}，"
               f"滑台软件读数={devices.head.position_mm():.3f} mm。")
+        w.say("GX28 的初始 0 mm 是预留区上端，随后准备到 -5 mm 才对刀。"
+              "再次上电时仍须人工核实初始零点，不能把上次对刀位直接当作它。")
         if not confirm_zero_state(w, devices.servo, devices.head,
                                   lambda servo, head: cli._prepare_live_zeros(
                                       servo, head, menu=menu or w, servo_required=False),
                                   servo_required=False):
             w.warn("未完成零点确认，未开始自动植入。")
             return 1
+        if not prepare_head_for_touch_off(w, devices.head, motion):
+            w.warn("未允许 GX28 对刀准备，未移动针头或开始自动植入。")
+            return 1
         touch_off = wait_for_work_datum(w, devices.cnc, include_y=True)
         datum = (touch_off[0], touch_off[2])
         row_y = touch_off[1]
+        motion, cut_safe = lift_head_after_touch_off(w, devices.head, motion)
         scan_z = wait_for_safe_height(w, devices.cnc, datum, plan)
         confirm_assertions(w)
         _apply(cfg, _local_sections(env, motion, scan_z))
+        cfg["head"]["cut_safe_mm"] = cut_safe
         write_local(local_path, cfg)
         w.say(f"已写入 {local_path}（含 scan_z_mm={scan_z:g} mm）")
         if profile_store is not None and profile_selection:
@@ -460,7 +511,8 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
         _check_consistency(cfg, cfg2)
         w.say(f"最终参数：{row2.x_count} 个植入点，{len(plan2.placements)} 次扎针动作（每次两针），"
               f"针距 {plan2.needle_pitch_mm:g} mm 伺服 {plan2.servo_target_mm:g} mm，"
-              f"对刀点 X={datum2[0]:g} Y={row_y:g} Z={datum2[1]:g} mm，安全高度 Z={scan_z2:g} mm。")
+              f"对刀点 X={datum2[0]:g} Y={row_y:g} Z={datum2[1]:g} mm，安全高度 Z={scan_z2:g} mm，"
+              f"剪丝额外抬升 {motion2.cut_clearance_mm:g} mm。")
         if not w.ask_yes_no("开始自动植入？", default=True):
             w.warn("操作员未放行，未开始自动植入。")
             return 1
@@ -495,16 +547,20 @@ def _reconcile_limits(w: Wizard, env: dict, plan) -> dict:
             limits = (x_max, y_max, limits[2])
 
 
-def _build_motion(row: PresetSpec) -> HeadMotion:
+def _build_motion(row: PresetSpec, cut_clearance_mm=5.0) -> HeadMotion:
     """下行目标由深度推导：深度沿垂直管面量，滑台竖直行程 = depth/cosθ。"""
-    return HeadMotion(standby_mm=0.0, insertion_mm=-row.slide_travel_mm,
-                      work_min_mm=WORK_MIN_MM, work_max_mm=0.0, datum_confirmed=True)
+    clearance = validate_cut_clearance_mm(cut_clearance_mm)
+    standby = -MAX_CUT_CLEARANCE_MM
+    return HeadMotion(standby_mm=standby, insertion_mm=standby-row.slide_travel_mm,
+                      work_min_mm=WORK_MIN_MM, work_max_mm=0.0, datum_confirmed=True,
+                      cut_clearance_mm=clearance)
 
 
 def _head_window(motion: HeadMotion) -> dict:
     return {"firmware_verified": True, "datum_confirmed": True,
             "standby_mm": motion.standby_mm, "insertion_mm": motion.insertion_mm,
-            "work_min_mm": motion.work_min_mm, "work_max_mm": motion.work_max_mm}
+            "work_min_mm": motion.work_min_mm, "work_max_mm": motion.work_max_mm,
+            "cut_safe_mm": motion.cut_position_mm}
 
 
 def _local_sections(env: dict, motion: HeadMotion, scan_z_mm: float | None = None) -> dict:
@@ -519,7 +575,7 @@ def _local_sections(env: dict, motion: HeadMotion, scan_z_mm: float | None = Non
         "servo": {"adapter": env["servo"].get("adapter", "")},
         "cnc3d": cnc3d,
         "head": {"port": env["head"]["port"], **_head_window(motion)},
-        "cycle": {"upper_release_after_retract": True},
+        "cycle": {"upper_release_after_retract": True, "cut_clearance_mm": motion.cut_clearance_mm},
     }
 
 

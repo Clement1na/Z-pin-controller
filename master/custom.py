@@ -10,7 +10,7 @@ from pathlib import Path
 
 from master.coordinator import Coordinator, RunState
 from master.local_config import load_merged
-from master.model import HeadMotion, MachineGeometry
+from master.model import HeadMotion, MachineGeometry, validate_cut_clearance_mm
 from master.planner import Placement, RowPlan
 from master.wizard import WizardCancelled
 
@@ -73,6 +73,7 @@ class CustomController:
         self.cfg = (deepcopy(prepared_config) if prepared_config is not None
                     else _load_config(store, selection, config_path))
         self.menu, self.debug = menu, debug
+        self._cut_coordinator = None
         from master.master import LiveDevices, UnavailableDevice, _known_geometry
         self.geometry = _known_geometry()
         self.warnings = []
@@ -117,16 +118,28 @@ class CustomController:
         self.values = candidate
         return dict(candidate)
 
-    def _motion(self, *, standby_only=False):
+    def _motion(self, *, standby_only=False, for_injection=False):
         hd = self.cfg.get("head", {})
         if hd.get("datum_confirmed") is not True or not all(k in hd for k in ("standby_mm", "work_min_mm", "work_max_mm")):
             raise RuntimeError("请先在机器配置中确认滑台待机位与安全工作窗口")
         standby = _finite(hd["standby_mm"], "待机位置")
         work_min = _finite(hd["work_min_mm"], "工作下界")
         travel = standby - work_min if standby_only else self.values["travel_mm"]
+        clearance = (validate_cut_clearance_mm(self.cfg.get("cycle", {}).get("cut_clearance_mm", 0.0))
+                     if for_injection else 0.0)
+        if clearance and standby+clearance > hd["work_max_mm"]:
+            raise RuntimeError("剪丝上升空间尚未记录；请先在实机向导完成 GX28 -5 mm 准备、对刀及上升距离设置")
+        if for_injection:
+            safe = _finite(hd.get("cut_safe_mm", standby+clearance), "剪丝安全位置")
+            if abs(safe-(standby+clearance)) > 0.05:
+                raise RuntimeError("记录的剪丝安全位置与上升距离不一致；请重新对刀")
         return HeadMotion(standby, insertion_from_travel(travel,
                           standby, work_min), work_min,
-                          hd["work_max_mm"], True)
+                          hd["work_max_mm"], True, cut_clearance_mm=clearance)
+
+    def _ensure_cut_finished(self):
+        if self._cut_coordinator is not None:
+            raise RuntimeError("正在等待剪丝；请先执行‘剪丝完成，恢复待机’，再移动或重新设零")
 
     def _check(self):
         if self._closed or self.cancel_event.is_set():
@@ -172,6 +185,8 @@ class CustomController:
         return device
 
     def _call(self, component, method, *args):
+        if method in ("move_mm", "move_to", "jog_setup_mm", "zero", "set_zero", "home", "unlock") or (component == "head" and method == "disable"):
+            self._ensure_cut_finished()
         device = self._device(component)
         self._check()
         return getattr(device, method)(*args)
@@ -193,6 +208,7 @@ class CustomController:
         return self._call("servo", "jog_setup_mm", delta)
 
     def head_travel(self, travel=None):
+        self._ensure_cut_finished()
         if travel is not None:
             self.update({"travel_mm": travel})
         motion = self._motion()
@@ -207,6 +223,7 @@ class CustomController:
     def head_stop(self): return self._call("head", "stop")
 
     def head_standby(self):
+        self._ensure_cut_finished()
         motion = self._motion(standby_only=True)
         head = self._device("head")
         head.motion = motion
@@ -239,9 +256,10 @@ class CustomController:
     def cnc_position(self): return self._call("cnc", "position")
 
     def inject_once(self):
-        if self.cfg.get("cycle", {}).get("upper_release_after_retract") is not True:
+        self._ensure_cut_finished()
+        motion = self._motion(for_injection=True)  # New motion for every button press.
+        if not motion.cut_clearance_mm and self.cfg.get("cycle", {}).get("upper_release_after_retract") is not True:
             raise RuntimeError("单次注入前必须确认回针后释放上夹持阀的时序")
-        motion = self._motion()  # New motion and coordinator for every button press.
         head = self._device("head")
         if not head.zero_confirmed:
             raise RuntimeError("单次注入前必须明确设置滑台机械零位")
@@ -264,9 +282,34 @@ class CustomController:
             device.cancel_event = self.cancel_event
         self._check()
         result = coordinator.run_single(plan)
+        if result.state is RunState.WAITING_OPERATOR:
+            self._cut_coordinator = coordinator
+            message = (f"GX28 已额外上抬 {motion.cut_clearance_mm:g} mm，电机保持使能，B 阀保持夹紧。"
+                       "剪丝后让双手离开，再执行‘剪丝完成，恢复待机’。")
+            if self.menu is not None:
+                self.menu.say(message)
+            else:
+                print(message)
+            return result
         if result.state is not RunState.COMPLETE:
             self.stop()
             raise RuntimeError(result.error or "单次注入未完成")
+        return result
+
+    def finish_cut(self):
+        self._check()
+        coordinator = self._cut_coordinator
+        if coordinator is None:
+            raise RuntimeError("没有等待确认的剪丝动作")
+        head = self.devices.head
+        position = head.position_mm()
+        if not head.zero_confirmed or not math.isfinite(position) or abs(position - coordinator.motion.cut_position_mm) > 0.05:
+            raise RuntimeError("剪丝等待位置或滑台零位已改变；未自动下降，请重新核实机械位置")
+        result = coordinator.finish_single_cut()
+        if result.state is not RunState.COMPLETE:
+            self.stop()
+            raise RuntimeError(result.error or "剪丝后恢复待机失败")
+        self._cut_coordinator = None
         return result
 
     def names(self): return self.store.list_names("custom")
@@ -396,19 +439,22 @@ def run_custom_menu(*, store, selection, config_path, debug=False, menu=None,
         ("19", "CNC 移动到 XYZ"), ("20", "CNC 回零"), ("21", "CNC 解锁"),
         ("22", "CNC 当前位置"), ("23", "单次注入（保持 CNC 当前坐标）"),
         ("24", "保存自定义配置"), ("25", "加载自定义配置"), ("26", "列出自定义配置"),
+        ("27", "剪丝完成，松开上阀并恢复滑台待机"),
         ("!", "全机停止"), ("0", "退出（Q 也可退出）"))
     simple = dict(zip(("2", "3", "4", "5", "6", "8", "9", "10", "11", "12", "13",
-                       "18", "20", "21", "23", "!"),
+                       "18", "20", "21", "23", "27", "!"),
                       (controller.servo_pitch, controller.servo_enable, controller.servo_set_zero,
                        controller.servo_release, controller.servo_reset_fault, controller.head_travel,
                        controller.head_standby, controller.head_enable, controller.head_zero,
                        controller.head_release, controller.head_stop, controller.valves_off,
-                       controller.cnc_home, controller.cnc_unlock, controller.inject_once, controller.stop)))
+                       controller.cnc_home, controller.cnc_unlock, controller.inject_once, controller.finish_cut, controller.stop)))
     try:
         menu.warn("每次上电必须重新核实实际机械零位；屏幕显示 0 不代表机械零位。")
         menu.warn("自定义下针行程不采用预设的 3 mm 深度上限，必须按实际工装核实行程。")
         while not controller.cancel_event.is_set():
             menu.say(f"自定义参数：{controller.values}")
+            menu.say(f"共用剪丝额外抬升：{controller.cfg.get('cycle', {}).get('cut_clearance_mm', 0)} mm。"
+                     "启用后单次植入会等待剪丝，选择27确认后松阀并下降；未确认不能开始下一次。")
             hd = controller.cfg.get("head", {})
             menu.say(f"滑台工作窗口：[{hd.get('work_min_mm', '未设置')}, "
                      f"{hd.get('work_max_mm', '未设置')}] mm；待机位：{hd.get('standby_mm', '未设置')} mm；"

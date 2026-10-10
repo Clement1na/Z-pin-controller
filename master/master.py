@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT))
 
 from master.coordinator import Coordinator, RunState
 from master.local_config import load_merged, local_path_for, write_local
-from master.model import PRESET_ANGLES, HeadMotion, MachineGeometry, PresetSpec
+from master.model import PRESET_ANGLES, HeadMotion, MachineGeometry, PresetSpec, validate_cut_clearance_mm
 from master.operator_gate import OperatorGate
 from master.planner import highest_work_z_mm, plan_at_y, plan_preset_row, work_z_mm
 from master.simulated import SimulationRig
@@ -99,8 +99,9 @@ def run_simulation(row: PresetSpec, *, inject_failure: bool = False, rows: int =
                    datum=SMOKE_DATUM, scan_z_mm: float = SMOKE_SCAN_Z_MM, plan=None) -> int:
     if plan is None:
         plan = plan_preset_row(row, _known_geometry())
-    motion = HeadMotion(standby_mm=0, insertion_mm=-row.slide_travel_mm,
-                        work_min_mm=-10, work_max_mm=0, datum_confirmed=True)
+    motion = HeadMotion(standby_mm=-5, insertion_mm=-5-row.slide_travel_mm,
+                        work_min_mm=-10, work_max_mm=0, datum_confirmed=True,
+                        cut_clearance_mm=5)
     rig = SimulationRig(standby_mm=motion.standby_mm, scan_z_mm=scan_z_mm,
                         fail_on_first_descent=inject_failure,
                         slope=plan.slope, datum=datum)
@@ -157,14 +158,22 @@ def _read_live_configuration(path: Path, confirmed: bool,
         raise ValueError("配置：对刀点 (x0, z0) 必须是两个有限数")
     # insertion_mm 不再手填：深度沿垂直管面量，滑台行程 = depth/cos(theta)。
     # [head] 段仍然要有待机与工作窗口，但下行目标是推导出来的。
-    motion = HeadMotion(standby_mm=required("head", "standby_mm"),
-                        insertion_mm=-row.slide_travel_mm,
+    cut_clearance = validate_cut_clearance_mm(cfg.get("cycle", {}).get("cut_clearance_mm", 0.0))
+    standby = required("head", "standby_mm")
+    motion = HeadMotion(standby_mm=standby,
+                        insertion_mm=standby-row.slide_travel_mm,
                         work_min_mm=required("head", "work_min_mm"),
                         work_max_mm=required("head", "work_max_mm"),
-                        datum_confirmed=required("head", "datum_confirmed"))
-    if not -10 <= motion.work_min_mm < motion.insertion_mm < motion.standby_mm == 0 == motion.work_max_mm:
-        raise ValueError("配置：head 必须使用实测过的负向下行窗口 [-10, 0] 与零位待机")
-    if required("cycle", "upper_release_after_retract") is not True:
+                        datum_confirmed=required("head", "datum_confirmed"),
+                        cut_clearance_mm=cut_clearance)
+    if not (-10 <= motion.work_min_mm <= motion.insertion_mm < motion.standby_mm <= 0
+            and motion.work_max_mm == 0):
+        raise ValueError("配置：head 必须使用负向下行窗口 [-10, 0]，对刀待机位与剪丝位置均不得高于 0 mm")
+    recorded_safe = cfg.get("head", {}).get("cut_safe_mm", motion.cut_position_mm)
+    if (isinstance(recorded_safe, bool) or not isinstance(recorded_safe, (int, float))
+            or not math.isfinite(recorded_safe) or abs(recorded_safe-motion.cut_position_mm) > 0.05):
+        raise ValueError("配置：记录的 GX28 剪丝安全位置与对刀待机位、上升距离不一致；请重新对刀")
+    if not cut_clearance and required("cycle", "upper_release_after_retract") is not True:
         raise ValueError("配置：只支持已在实机验证过的上阀释放流程")
     scan_z = required("cnc3d", "scan_z_mm")
     # 只查上界。这些限位是 work-coordinate limit（见 config.toml 注释），工件坐标本来
@@ -539,7 +548,7 @@ def _execute_live_job(cfg: dict, row: PresetSpec, motion: HeadMotion, scan_z: fl
     if any(not 0 <= p.cnc_y_mm <= cfg["cnc3d"]["y_max"] for p in plan.placements):
         raise ValueError("对刀 Y 与排程落点超出 CNC Y 软限位，未开始自动植入")
     print(f"本排固定 CNC Y={row_y_mm:g} mm（本次对刀位置）；植入及换排回排头均保持此 Y。")
-    gate = OperatorGate()
+    gate = OperatorGate(cut_clearance_mm=motion.cut_clearance_mm)
     turn_gate = RowTurnGate()
     reporter = _make_reporter(row, plan, motion, scan_z, results_dir, datum=datum)
     coordinator = Coordinator(devices.servo, devices.cnc, devices.head, motion,
@@ -555,8 +564,11 @@ def _execute_live_job(cfg: dict, row: PresetSpec, motion: HeadMotion, scan_z: fl
             return False
         return turn_gate.wait_for_turn(completed_rows, cancel)
 
-    print("实时运行：每次两针退回且 B 阀排气后，请剪丝并按回车移动到下一落点；"
-          "一排跑完后滑台抬到安全高度并回到排头，剪丝转管后按回车继续下一排；"
+    print((f"实时运行：每次退针后 GX28 额外上抬 {motion.cut_clearance_mm:g} mm，B 阀保持夹紧；"
+           "剪丝完成并让双手离开后按回车，松开 B 阀并恢复滑台待机。最后一次同样需要确认；"
+           if motion.cut_clearance_mm else
+           "实时运行：每次两针退回且 B 阀排气后，请剪丝并按回车移动到下一落点；")
+          + "一排跑完后 CNC 抬到安全高度并回到排头，转管后按回车继续下一排；"
           "输入 D 正常收工，输入 ! 请求三路停止。")
     commands: queue.Queue[str] = queue.Queue()
     stop_reading = threading.Event()
@@ -598,6 +610,8 @@ def _execute_live_job(cfg: dict, row: PresetSpec, motion: HeadMotion, scan_z: fl
     # 所以只置标志不 join——置了标志它就绝不会再把后续输入当成急停指令。
     stop_reading.set()
     if not holder or isinstance(holder[0], Exception):
+        if reporter is not None:
+            reporter.close()
         raise RuntimeError(f"实机总控在动作前失败：{holder[0] if holder else '没有返回结果'}")
     result = holder[0]
     print(_result_line(result))
