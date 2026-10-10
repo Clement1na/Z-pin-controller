@@ -120,6 +120,7 @@ class RunReporter:
             "finished_at": datetime.now().isoformat(),
             "scan_z_mm": self.scan_z_mm,
             "z_datum": list(self.datum) if self.datum is not None else None,
+            "row_y_mm": self.plan.placements[0].cnc_y_mm if self.plan.placements else None,
             "job": asdict(self.job),
             "machine": asdict(self.machine),
             "motion": asdict(self.motion),

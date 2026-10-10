@@ -17,7 +17,7 @@ from master.coordinator import Coordinator, RunState
 from master.local_config import load_merged, local_path_for, write_local
 from master.model import PRESET_ANGLES, HeadMotion, MachineGeometry, PresetSpec
 from master.operator_gate import OperatorGate
-from master.planner import highest_work_z_mm, plan_preset_row, work_z_mm
+from master.planner import highest_work_z_mm, plan_at_y, plan_preset_row, work_z_mm
 from master.simulated import SimulationRig
 
 
@@ -128,7 +128,8 @@ def run_simulation(row: PresetSpec, *, inject_failure: bool = False, rows: int =
 
 def _read_live_configuration(path: Path, confirmed: bool,
                              job_overrides: dict[str, float] | None = None, *,
-                             datum: tuple[float, float] | None = None, job_source=None):
+                             datum: tuple[float, float] | None = None, job_source=None,
+                             row_y_mm: float | None = None):
     if not confirmed:
         raise ValueError("配置：实机模式必须给出 --confirm-datum")
     # 模板 + 同级的 config.local.toml（向导生成）。本机文件不存在时完全等价于只读模板。
@@ -173,6 +174,10 @@ def _read_live_configuration(path: Path, confirmed: bool,
     if scan_z > required("cnc3d", "z_max"):
         raise ValueError("配置：scan_z_mm 超出 CNC Z 软限位")
     plan = source.plan(row, geometry)
+    if row_y_mm is not None:
+        absolute_plan = plan_at_y(plan, row_y_mm)
+        if any(not 0 <= p.cnc_y_mm <= required("cnc3d", "y_max") for p in absolute_plan.placements):
+            raise ValueError("配置：对刀 Y 与排程落点超出 CNC Y 软限位")
     if (max(max(p.cnc_x_mm, *(hit[0] for hit in p.needle_hits)) for p in plan.placements) > required("cnc3d", "x_max")
             or max(p.cnc_y_mm for p in plan.placements) > required("cnc3d", "y_max")):
         raise ValueError("配置：排程落点超出 CNC X/Y 软限位")
@@ -524,7 +529,16 @@ def _make_reporter(row, plan, motion, scan_z, results_dir, *, datum=None):
 def _execute_live_job(cfg: dict, row: PresetSpec, motion: HeadMotion, scan_z: float,
                       plan, devices: LiveDevices, *, datum=None, rows: int | None = None,
                       results_dir: Path | None = None, echo=None,
-                      command_reader=None) -> int:
+                      command_reader=None, row_y_mm: float | None = None) -> int:
+    if row_y_mm is None:
+        position = devices.cnc.position()
+        if position is None:
+            raise RuntimeError("无法读取 CNC 当前 Y，未开始自动植入")
+        row_y_mm = position[1]
+    plan = plan_at_y(plan, row_y_mm)
+    if any(not 0 <= p.cnc_y_mm <= cfg["cnc3d"]["y_max"] for p in plan.placements):
+        raise ValueError("对刀 Y 与排程落点超出 CNC Y 软限位，未开始自动植入")
+    print(f"本排固定 CNC Y={row_y_mm:g} mm（本次对刀位置）；植入及换排回排头均保持此 Y。")
     gate = OperatorGate()
     turn_gate = RowTurnGate()
     reporter = _make_reporter(row, plan, motion, scan_z, results_dir, datum=datum)

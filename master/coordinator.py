@@ -88,7 +88,7 @@ class Coordinator:
         if self.cancel_event.wait(self.valve_delay_s):
             raise _StopRequested()
 
-    def _check_ready(self) -> None:
+    def _check_ready(self, plan: RowPlan) -> None:
         if not self.operator_confirmed:
             raise RuntimeError("作业前必须由操作员确认 CNC 工作零点并保证行程无障碍")
         for name, device in (("SV630N 伺服", self.servo), ("CNC 三维模组", self.cnc),
@@ -104,6 +104,8 @@ class Coordinator:
         position = self.cnc.position()
         if position is None or abs(position[2] - self.scan_z_mm) > 0.05:
             raise RuntimeError("作业前 CNC 必须位于已确认的 scan_z_mm 高度")
+        if not math.isfinite(position[1]) or abs(position[1] - plan.placements[0].cnc_y_mm) > 0.05:
+            raise RuntimeError("作业前 CNC Y 与对刀时确认的位置不一致；请重新对刀，抬刀时只调整 Z")
         if abs(self.head.position_mm() - self.motion.standby_mm) > 0.05:
             raise RuntimeError("滑台不在已确认的 standby_mm 待机位")
 
@@ -231,7 +233,7 @@ class Coordinator:
         total = len(plan.placements)
         if total > 1 and self.confirm_next is None:
             raise RuntimeError("剪丝并重新装丝后，每次进入下一落点都需要操作员确认")
-        self._check_ready()
+        self._check_ready(plan)
         self._completed = 0
         completed_rows = 0
         head = plan.placements[0]

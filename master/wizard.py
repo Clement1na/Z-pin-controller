@@ -306,8 +306,8 @@ def confirm_zero_state(w: Wizard, servo, head, prepare_zeros, *, servo_required=
     return prepare_zeros(servo, head)
 
 
-def wait_for_work_datum(w: Wizard, cnc) -> tuple[float, float]:
-    """对刀：读回 **(x0, z0)** 两个坐标，不只是 Z。
+def wait_for_work_datum(w: Wizard, cnc, *, include_y=False) -> tuple:
+    """Read touch-off coordinates; live operation retains Y as well as X/Z.
 
     针尖连线与管面平行，所以排内 Z 必须跟着 X 走：`z(x) = z0 + (x-x0)·tanθ`。
     X 也是必需的一半——只记 Z 就无从知道从哪儿开始算斜率。
@@ -321,8 +321,8 @@ def wait_for_work_datum(w: Wizard, cnc) -> tuple[float, float]:
             w.warn("读不到 CNC 工作坐标（WPos）。请检查 USB 连接和控制器状态后重试。")
             continue
         w.say(f"当前 CNC 工作坐标：X={position[0]:.3f} Y={position[1]:.3f} Z={position[2]:.3f} mm")
-        if w.ask_yes_no(f"把 X={position[0]:.3f} Z={position[2]:.3f} mm 记为对刀点？", default=True):
-            return (position[0], position[2])
+        if w.ask_yes_no(f"把 X={position[0]:.3f} Y={position[1]:.3f} Z={position[2]:.3f} mm 记为对刀点？", default=True):
+            return tuple(position) if include_y else (position[0], position[2])
         w.say("好的，请重新对刀。")
 
 
@@ -438,7 +438,9 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
                                   servo_required=False):
             w.warn("未完成零点确认，未开始自动植入。")
             return 1
-        datum = wait_for_work_datum(w, devices.cnc)
+        touch_off = wait_for_work_datum(w, devices.cnc, include_y=True)
+        datum = (touch_off[0], touch_off[2])
+        row_y = touch_off[1]
         scan_z = wait_for_safe_height(w, devices.cnc, datum, plan)
         confirm_assertions(w)
         _apply(cfg, _local_sections(env, motion, scan_z))
@@ -453,16 +455,17 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
 
         # 用写出的文件重新校验一遍：写出器的 bug 必须在这里暴露，而不是在运动中途。
         cfg2, row2, _, motion2, scan_z2, plan2, datum2 = cli._read_live_configuration(
-            config_path, True, preset_values(row), datum=datum, job_source=source)
+            config_path, True, preset_values(row), datum=datum, job_source=source,
+            row_y_mm=row_y)
         _check_consistency(cfg, cfg2)
         w.say(f"最终参数：{row2.x_count} 个植入点，{len(plan2.placements)} 次扎针动作（每次两针），"
               f"针距 {plan2.needle_pitch_mm:g} mm 伺服 {plan2.servo_target_mm:g} mm，"
-              f"对刀点 X={datum2[0]:g} Z={datum2[1]:g} mm，安全高度 Z={scan_z2:g} mm。")
+              f"对刀点 X={datum2[0]:g} Y={row_y:g} Z={datum2[1]:g} mm，安全高度 Z={scan_z2:g} mm。")
         if not w.ask_yes_no("开始自动植入？", default=True):
             w.warn("操作员未放行，未开始自动植入。")
             return 1
         return cli._execute_live_job(cfg2, row2, motion2, scan_z2, plan2, devices,
-                                     datum=datum2,
+                                     datum=datum2, row_y_mm=row_y,
                                      results_dir=_results_dir(config_path, results_dir),
                                      echo=echo, command_reader=command_reader)
     except WizardCancelled as exc:
