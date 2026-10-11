@@ -10,6 +10,7 @@ from tkinter import ttk
 
 from master.gui.menu import parse_float
 from master.coordinator import RunState
+from master.model import MAX_DEPTH_MM
 
 _ACTION_LABELS = {
     "servo_pitch": "针距移动", "servo_enable": "伺服使能", "servo_set_zero": "伺服设零",
@@ -151,7 +152,7 @@ class CustomPage(tk.Toplevel):
         for label, action in (("返回待机位", "head_standby"), ("使能", "head_enable"),
                               ("当前位置设零", "head_zero"), ("释放", "head_release"), ("停止滑台", "head_stop")):
             self._button(head, label, action)
-        ttk.Label(head, text="此处为滑台行程，受工作窗口约束；不是植入深度的 ≤3 mm 限制。\n设零前确认机械位置与工作窗口。",
+        ttk.Label(head, text=f"此处为滑台行程，受工作窗口约束；不是植入深度的 ≤{MAX_DEPTH_MM:g} mm 限制。\n设零前确认机械位置与工作窗口。",
                   wraplength=260, foreground="#b00020").pack(anchor="w", pady=4)
         self.window_label = ttk.Label(head, text="工作窗口：加载中…", wraplength=260)
         self.window_label.pack(anchor="w", pady=4)

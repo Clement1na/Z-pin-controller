@@ -10,7 +10,7 @@ from pathlib import Path
 
 from master.coordinator import Coordinator, RunState
 from master.local_config import load_merged
-from master.model import HeadMotion, MachineGeometry, validate_cut_clearance_mm
+from master.model import MAX_DEPTH_MM, HeadMotion, MachineGeometry, validate_cut_clearance_mm
 from master.planner import Placement, RowPlan
 from master.wizard import WizardCancelled
 
@@ -450,7 +450,7 @@ def run_custom_menu(*, store, selection, config_path, debug=False, menu=None,
                        controller.cnc_home, controller.cnc_unlock, controller.inject_once, controller.finish_cut, controller.stop)))
     try:
         menu.warn("每次上电必须重新核实实际机械零位；屏幕显示 0 不代表机械零位。")
-        menu.warn("自定义下针行程不采用预设的 3 mm 深度上限，必须按实际工装核实行程。")
+        menu.warn(f"自定义下针行程不采用预设的 {MAX_DEPTH_MM:g} mm 深度上限，必须按实际工装核实行程。")
         while not controller.cancel_event.is_set():
             menu.say(f"自定义参数：{controller.values}")
             menu.say(f"共用剪丝额外抬升：{controller.cfg.get('cycle', {}).get('cut_clearance_mm', 0)} mm。"

@@ -41,4 +41,4 @@ upper_release_after_retract = false  # legacy 0-clearance flow only; positive cl
                          # One job is one row; the tube is turned by hand and the row repeats.
 # angle_deg = 15.0       # choose 0, 15 or 30 degrees; needles stay vertical
 # count = 7              # preset density 7/10/15; fixed 20 mm zone, fixed 10 mm needle pitch
-# depth_mm = 2.0         # perpendicular to the tube wall; hard limit 3 mm (metal joint below)
+# depth_mm = 2.0         # perpendicular to the tube wall; limit 5 mm, also bound by slide window

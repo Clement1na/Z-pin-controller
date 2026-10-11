@@ -5,9 +5,9 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-#: Hard process limit. The carbon wall is 2 mm thick and the metal joint sits
-#: directly below it, so a mistyped depth is a collision, not a bad sample.
-MAX_DEPTH_MM = 3.0
+#: Operator-specified perpendicular insertion depth; the actual slide window
+#: is checked separately after accounting for the fixture angle and standby.
+MAX_DEPTH_MM = 5.0
 
 # Extra GX28 lift confirmed by the operator for cutting the implanted wire.
 MAX_CUT_CLEARANCE_MM = 5.0
@@ -80,8 +80,7 @@ class PresetSpec:
             raise ValueError("angle_deg 只支持 0、15、30 度")
         if self.depth_mm > MAX_DEPTH_MM:
             raise ValueError(
-                f"depth_mm 沿垂直管面量，不得超过 {MAX_DEPTH_MM:g} mm；"
-                f"碳管壁下方就是金属接头"
+                f"depth_mm 沿垂直管面量，不得超过 {MAX_DEPTH_MM:g} mm"
             )
         if isinstance(self.count, bool) or not isinstance(self.count, int) or self.count < 2:
             raise ValueError("count 必须是不小于 2 的整数")

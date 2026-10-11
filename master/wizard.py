@@ -67,7 +67,7 @@ class Wizard:
                   maximum: float | None = None, default: str | None = None,
                   unit: str = "mm", too_big: str | None = None) -> float:
         """``too_big`` 覆盖上限报错文案。工艺上限不只是"数字大了"——比如植入深度
-        的上限是金属接头的位置，报错必须把机械原因说出来，不然操作员只会再试一次。
+        的上限与实际滑台工作窗口分别检查，提示应说明当前输入限制。
         """
         def parse(raw: str) -> float:
             try:
@@ -260,7 +260,7 @@ def collect_preset(w: Wizard, geometry, *, defaults=None):
         depth = w.ask_float(f"植入深度 mm（垂直管面，不超过 {MAX_DEPTH_MM:g}）",
                             minimum=MIN_DIMENSION_MM, maximum=MAX_DEPTH_MM,
                             default=_default_text(defaults.get("depth_mm")),
-                            too_big="必须不大于 3 mm——碳管壁下方就是金属接头")
+                            too_big=f"必须不大于 {MAX_DEPTH_MM:g} mm")
         try:
             row = PresetSpec(angle, count, depth)
             plan = plan_preset_row(row, geometry)
@@ -551,6 +551,10 @@ def _build_motion(row: PresetSpec, cut_clearance_mm=5.0) -> HeadMotion:
     """下行目标由深度推导：深度沿垂直管面量，滑台竖直行程 = depth/cosθ。"""
     clearance = validate_cut_clearance_mm(cut_clearance_mm)
     standby = -MAX_CUT_CLEARANCE_MM
+    if standby-row.slide_travel_mm < WORK_MIN_MM:
+        raise ValueError(f"滑台行程超出当前工作窗口：{row.angle_deg:g}°、深度 {row.depth_mm:g} mm "
+                         f"需要下行 {row.slide_travel_mm:.3f} mm；从对刀位 {standby:g} mm "
+                         f"最多可下行 {standby-WORK_MIN_MM:g} mm。未连接设备，请减小深度。")
     return HeadMotion(standby_mm=standby, insertion_mm=standby-row.slide_travel_mm,
                       work_min_mm=WORK_MIN_MM, work_max_mm=0.0, datum_confirmed=True,
                       cut_clearance_mm=clearance)
