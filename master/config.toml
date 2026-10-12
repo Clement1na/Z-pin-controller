@@ -12,9 +12,7 @@ vel_mm_s = 1.0
 port = ""                  # TTC450 Pro USB serial port
 baud = 115200
 feed = 1500
-x_max = 100.0             # replace with measured safe work-coordinate limit
-y_max = 100.0
-z_max = 50.0
+# CNC travel limits are enforced by its controller, not by work-coordinate bounds here.
 # scan_z_mm = ...         # row-change clearance: high enough to turn the tube, and
                           # it must clear the HIGHEST work height anywhere in the row
 

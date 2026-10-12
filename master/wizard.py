@@ -20,7 +20,6 @@ from master.planner import highest_work_z_mm, plan_preset_row
 # 对应固件 insert_head.ino 的下行软件限位；实际机械余量仍须人工确认。
 WORK_MIN_MM = HEAD_WORK_MIN_MM
 MIN_DIMENSION_MM = 0.001
-DEFAULT_LIMIT_MM = 400.0
 
 
 class WizardCancelled(Exception):
@@ -209,7 +208,7 @@ def _pick_by_number(w: Wizard, text: str, items):
 
 # ------------------------------------------------------------------ 环境
 def collect_environment(w: Wizard, existing, *, find_adapters=None, list_ports=None) -> dict:
-    """采集本机环境（网卡、两个串口、CNC 软限位）。这些值会被持久化。"""
+    """采集本机环境（网卡、两个串口）。这些值会被持久化。"""
     w.say("=== 环境配置（保存到 config.local.toml，下次运行作为默认值）===")
     adapter = _reuse_or_choose(
         w, "EtherCAT 网卡", existing.get("servo", {}).get("adapter"),
@@ -221,12 +220,9 @@ def collect_environment(w: Wizard, existing, *, find_adapters=None, list_ports=N
         w, "GX28 植入滑台串口", existing.get("head", {}).get("port"),
         lambda: select_serial_port(w, role="GX28 植入滑台",
                                    exclude=(cnc_port,), list_ports=list_ports))
-    cnc = existing.get("cnc3d", {})
-    limits = {name: _ask_limit(w, f"CNC {axis} 软限位上限 mm", cnc.get(name))
-              for name, axis in (("x_max", "X"), ("y_max", "Y"), ("z_max", "Z"))}
     return {
         "servo": {"adapter": adapter},
-        "cnc3d": {"port": cnc_port, **limits},
+        "cnc3d": {"port": cnc_port},
         "head": {"port": head_port},
     }
 
@@ -237,11 +233,6 @@ def _reuse_or_choose(w: Wizard, label: str, current, choose):
         if w.ask_yes_no("沿用这个值？", default=True):
             return current
     return choose()
-
-
-def _ask_limit(w: Wizard, prompt: str, current) -> float:
-    default = f"{float(current):g}" if current else f"{DEFAULT_LIMIT_MM:g}"
-    return w.ask_float(prompt, minimum=1.0, default=default)
 
 
 # ------------------------------------------------------------------ 作业
@@ -397,17 +388,6 @@ def lift_head_after_touch_off(w: Wizard, head, motion: HeadMotion) -> tuple[Head
     return lifted, readback
 
 
-def check_limits(plan, limits) -> None:
-    """排程落点是否落在 CNC 软限位内；不满足则抛 ValueError。"""
-    x_max, y_max, _ = limits
-    reach_x = max(max(placement.cnc_x_mm, *(hit[0] for hit in placement.needle_hits))
-                  for placement in plan.placements)
-    reach_y = max(placement.cnc_y_mm for placement in plan.placements)
-    if reach_x > x_max or reach_y > y_max:
-        raise ValueError(f"排程需要 X≥{reach_x:g}、Y≥{reach_y:g} mm，"
-                         f"当前软限位只有 X={x_max:g}、Y={y_max:g} mm")
-
-
 def confirm_assertions(w: Wizard) -> None:
     """开机前必须由操作员断言的三个事实。
 
@@ -457,14 +437,9 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
         else:
             cfg = deepcopy(prepared_config)
         env = {section: dict(cfg.get(section, {})) for section in ("servo", "cnc3d", "head")}
-        for key, axis in (("x_max", "X"), ("y_max", "Y"), ("z_max", "Z")):
-            value = env["cnc3d"].get(key)
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-                env["cnc3d"][key] = _ask_limit(w, f"CNC {axis} 软限位上限 mm", None)
         row, _ = collect_preset(w, geometry, defaults={**cfg.get("job", {}), **(job_overrides or {})})
         row = source.build(cfg, {**preset_values(row), **(job_overrides or {})})
         plan = source.plan(row, geometry)
-        env = _reconcile_limits(w, env, plan)
         clearance = cfg.get("cycle", {}).get("cut_clearance_mm", DEFAULT_CUT_CLEARANCE_MM)
         # Earlier preparations reserved only 5 mm. Offer the new default when
         # redoing that setup; retain a chosen clearance from a 10 mm setup.
@@ -538,20 +513,6 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
 def _apply(cfg: dict, env: dict) -> None:
     for section, values in env.items():
         cfg.setdefault(section, {}).update(values)
-
-
-def _reconcile_limits(w: Wizard, env: dict, plan) -> dict:
-    limits = (env["cnc3d"]["x_max"], env["cnc3d"]["y_max"], env["cnc3d"]["z_max"])
-    while True:
-        try:
-            check_limits(plan, limits)
-            return env
-        except ValueError as exc:
-            w.warn(f"{exc}。请重新输入 CNC 软限位。")
-            x_max = w.ask_float("CNC X 软限位上限 mm", minimum=1.0, default=f"{limits[0]:g}")
-            y_max = w.ask_float("CNC Y 软限位上限 mm", minimum=1.0, default=f"{limits[1]:g}")
-            env["cnc3d"].update(x_max=x_max, y_max=y_max)
-            limits = (x_max, y_max, limits[2])
 
 
 def _build_motion(row: PresetSpec, cut_clearance_mm=DEFAULT_CUT_CLEARANCE_MM) -> HeadMotion:

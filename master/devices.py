@@ -250,12 +250,11 @@ class Cnc3D:
     """三维模组。每次 move_to 都会等运动完成（wait_idle）。"""
 
     def __init__(self, port: str = "COM9", baud: int = 115200,
-                 feed: int = 1500, limits=(100.0, 100.0, 50.0),
+                 feed: int = 1500,
                  controller_factory=None, echo=None):
         self.port = port
         self.baud = baud
         self.feed = feed
-        self.limits = limits
         self.controller_factory = controller_factory
         self.echo = echo
         self.cancel_event = None
@@ -295,13 +294,9 @@ class Cnc3D:
         """绝对定位并等待到位。"""
         if not self.connected:
             raise RuntimeError("三维模组未连接")
-        lx, ly, lz = self.limits
-        # Z 只查上界。这三个是 work-coordinate limit，工件坐标本来就可负：对刀点是针尖
-        # 接触管顶母线的高度，排间安全高度与排内工作 Z 在同一个坐标系里读回来，自然也
-        # 是负的。硬加下界会逼操作员重设一个向导从没要求过的 Z 工件零点。X/Y 的下界
-        # 保留——排头就是 X=0，往负走是回到工件外面。防扎管靠的是排间安全高度那条检查。
-        if not all(math.isfinite(v) for v in (x, y, z)) or not (0 <= x <= lx and 0 <= y <= ly and z <= lz):
-            raise ValueError(f"目标 ({x},{y},{z}) 超出软限位 (X 0..{lx}, Y 0..{ly}, Z 上限 {lz})")
+        # 行程限制由 CNC 下位机负责；工作坐标允许负值和不同的工件零点。
+        if not all(math.isfinite(v) for v in (x, y, z)):
+            raise ValueError("CNC 目标坐标必须是有限数")
         chosen_feed = self.feed if feed is None else feed
         if not math.isfinite(chosen_feed) or chosen_feed <= 0:
             raise ValueError("CNC 进给速度必须为正")

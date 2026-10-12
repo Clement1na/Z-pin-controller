@@ -93,7 +93,7 @@ class CustomController:
             self._monitor.start()
 
     def _initial_values(self, cfg):
-        """Recover each invalid UI field independently; movement validates its own limits."""
+        """Recover each invalid UI field independently; actions validate their own parameters."""
         section = cfg.get("custom", {})
         if not isinstance(section, dict):
             self._warn("[custom] 参数表无效；使用默认值，其他组件仍可操作")

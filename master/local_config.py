@@ -2,7 +2,7 @@
 """本机配置叠加层。
 
 `master/config.toml` 是随仓库发布的模板，含实测标定值，任何人都不该手改；
-`config.local.toml` 与它同级，只存本机环境（串口、网卡、软限位），由向导生成。
+`config.local.toml` 与它同级，保存本机环境与作业参数，由向导生成。
 读取时后者按配置段叠加在前者之上；本机文件不存在则完全等价于只读模板。
 
 `tomllib` 只能读，而交付物必须零依赖，所以写出器在这里手写。
@@ -19,7 +19,7 @@ from typing import Mapping
 LOCAL_NAME = "config.local.toml"
 
 HEADER = (
-    "本机配置：由 master/wizard.py 生成，只保存本机环境（串口/网卡/软限位）。",
+    "本机配置：由 master/wizard.py 生成，保存接口、运动标定与作业参数。",
     "叠加在 config.toml 模板之上，本文件中出现的键优先。",
     "已在 .gitignore 中，请勿提交到版本库。",
 )

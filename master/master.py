@@ -174,20 +174,12 @@ def _read_live_configuration(path: Path, confirmed: bool,
     if not cut_clearance and required("cycle", "upper_release_after_retract") is not True:
         raise ValueError("配置：只支持已在实机验证过的上阀释放流程")
     scan_z = required("cnc3d", "scan_z_mm")
-    # 只查上界。这些限位是 work-coordinate limit（见 config.toml 注释），工件坐标本来
-    # 就可负：对刀点 z0 允许为负（测试里 --datum-z -5 就是合法的），安全高度在同一个
-    # 坐标系里读回来自然也可是负的。硬加 ">= 0" 会逼操作员在向导从没要求过的地方重设
-    # Z 工件零点。真正防扎管的是下面那条"必须高过排内最高工作点"。
-    if scan_z > required("cnc3d", "z_max"):
-        raise ValueError("配置：scan_z_mm 超出 CNC Z 软限位")
+    if (isinstance(scan_z, bool) or not isinstance(scan_z, (int, float))
+            or not math.isfinite(scan_z)):
+        raise ValueError("配置：scan_z_mm 必须是有限数")
     plan = source.plan(row, geometry)
     if row_y_mm is not None:
-        absolute_plan = plan_at_y(plan, row_y_mm)
-        if any(not 0 <= p.cnc_y_mm <= required("cnc3d", "y_max") for p in absolute_plan.placements):
-            raise ValueError("配置：对刀 Y 与排程落点超出 CNC Y 软限位")
-    if (max(max(p.cnc_x_mm, *(hit[0] for hit in p.needle_hits)) for p in plan.placements) > required("cnc3d", "x_max")
-            or max(p.cnc_y_mm for p in plan.placements) > required("cnc3d", "y_max")):
-        raise ValueError("配置：排程落点超出 CNC X/Y 软限位")
+        plan_at_y(plan, row_y_mm)  # 仍验证对刀 Y 为有限数；实际绑定在运行时进行。
     # 排间安全高度必须高过排内**最高**的工作点。theta 带符号：正角时最高点在排尾、
     # 负角时在排头。写成 min 或假定单调，负角下"抬到安全高度"会变成向下扎进管子。
     highest = highest_work_z_mm(plan, datum)
@@ -450,8 +442,7 @@ def _open_live_component(name, cfg, geometry, motion=None, *, echo=None):
         return ServoAxis(adapter=values["adapter"], lead_mm=geometry.servo_lead_mm,
                          counts_per_rev=values["counts_per_rev"], vel_mm_s=values["vel_mm_s"], echo=echo)
     if name == "cnc":
-        return Cnc3D(port=values["port"], baud=values["baud"], feed=values["feed"],
-                     limits=(values["x_max"], values["y_max"], values["z_max"]), echo=echo)
+        return Cnc3D(port=values["port"], baud=values["baud"], feed=values["feed"], echo=echo)
     return InsertHead(port=values["port"], baud=values.get("baud", 115200), travel_mm=values.get("travel_mm", 50.0),
                       motion=motion, echo=echo, serial_factory=_open_head_serial)
 
@@ -543,8 +534,6 @@ def _execute_live_job(cfg: dict, row: PresetSpec, motion: HeadMotion, scan_z: fl
             raise RuntimeError("无法读取 CNC 当前 Y，未开始自动植入")
         row_y_mm = position[1]
     plan = plan_at_y(plan, row_y_mm)
-    if any(not 0 <= p.cnc_y_mm <= cfg["cnc3d"]["y_max"] for p in plan.placements):
-        raise ValueError("对刀 Y 与排程落点超出 CNC Y 软限位，未开始自动植入")
     print(f"本排固定 CNC Y={row_y_mm:g} mm（本次对刀位置）；植入及换排回排头均保持此 Y。")
     gate = OperatorGate(cut_clearance_mm=motion.cut_clearance_mm)
     turn_gate = RowTurnGate()
