@@ -28,9 +28,9 @@ datum_confirmed = false  # set true only after measuring the signed useful windo
 # Automatic insertion_mm is DERIVED: standby_mm-depth/cos(theta). Custom uses
 # the explicit slide travel within the confirmed window. Depth is measured
 # perpendicular to the tube wall. A value written here is ignored.
-# work_min_mm = -15.0     # firmware guard; actual mechanical clearance must be checked
+# work_min_mm = -30.0     # firmware guard; actual mechanical clearance must be checked
 # standby_mm = -10.0     # reserve 10 mm before CNC touch-off; software zero stays unchanged
-# work_max_mm = 15.0      # current firmware software window: [-15, 15]
+# work_max_mm = 30.0      # software window [-30, 30]; NOT 60 mm of physical slide travel
 
 [cycle]
 valve_delay_ms = 500

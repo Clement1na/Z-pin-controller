@@ -7,8 +7,8 @@ from dataclasses import dataclass
 
 # Match the firmware's software travel guards; the operator still confirms
 # the actual mechanical zero and available travel before motion.
-HEAD_WORK_MIN_MM = -15.0
-HEAD_WORK_MAX_MM = 15.0
+HEAD_WORK_MIN_MM = -30.0
+HEAD_WORK_MAX_MM = 30.0
 HEAD_PRE_DESCENT_MM = 10.0
 DEFAULT_CUT_CLEARANCE_MM = 10.0
 MAX_CUT_CLEARANCE_MM = 10.0
