@@ -91,6 +91,10 @@ if (-not (Test-Path -LiteralPath $config)) {
 }
 $readmeName = (-join ([char[]]@(0x4f7f, 0x7528, 0x8bf4, 0x660e))) + '.md'
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'README.md') -Destination (Join-Path $staged $readmeName)
+# Ship the matching sketch for later flashing; never flash from the builder.
+$firmwareDir = Join-Path $staged 'firmware\insert_head'
+New-Item -ItemType Directory -Path $firmwareDir -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $root 'firmware\insert_head\insert_head.ino') -Destination $firmwareDir
 
 Assert-DeliveryClosed
 foreach ($path in @($target, $staged, $previous)) { Assert-WorkspacePath $path }

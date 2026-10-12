@@ -5,18 +5,19 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-#: Operator-specified perpendicular insertion depth; the actual slide window
-#: is checked separately after accounting for the fixture angle and standby.
-MAX_DEPTH_MM = 5.0
-
-# Extra GX28 lift confirmed by the operator for cutting the implanted wire.
-MAX_CUT_CLEARANCE_MM = 5.0
+# Match the firmware's software travel guards; the operator still confirms
+# the actual mechanical zero and available travel before motion.
+HEAD_WORK_MIN_MM = -15.0
+HEAD_WORK_MAX_MM = 15.0
+HEAD_PRE_DESCENT_MM = 10.0
+DEFAULT_CUT_CLEARANCE_MM = 10.0
+MAX_CUT_CLEARANCE_MM = 10.0
 
 
 def validate_cut_clearance_mm(value: float) -> float:
     if (isinstance(value, bool) or not isinstance(value, (int, float))
             or not math.isfinite(value) or not 0 <= value <= MAX_CUT_CLEARANCE_MM):
-        raise ValueError("剪丝额外抬升距离必须在 0..5 mm 内")
+        raise ValueError(f"剪丝额外抬升距离必须在 0..{MAX_CUT_CLEARANCE_MM:g} mm 内")
     return float(value)
 
 #: Supported fixture angles, shared by all entry points.
@@ -78,10 +79,6 @@ class PresetSpec:
         _positive("depth_mm", self.depth_mm)
         if self.angle_deg not in PRESET_ANGLES:
             raise ValueError("angle_deg 只支持 0、15、30 度")
-        if self.depth_mm > MAX_DEPTH_MM:
-            raise ValueError(
-                f"depth_mm 沿垂直管面量，不得超过 {MAX_DEPTH_MM:g} mm"
-            )
         if isinstance(self.count, bool) or not isinstance(self.count, int) or self.count < 2:
             raise ValueError("count 必须是不小于 2 的整数")
 

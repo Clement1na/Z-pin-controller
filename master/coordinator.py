@@ -128,6 +128,9 @@ class Coordinator:
         self._check_head_position()
 
     def _check_head_position(self) -> None:
+        verify = getattr(self.head, "verify_work_window", None)
+        if verify is not None:
+            verify(self.motion)
         position = self.head.position_mm()
         expected = (self.motion.standby_mm, self.motion.cut_position_mm)
         if not math.isfinite(position) or all(abs(position - target) > 0.05 for target in expected):

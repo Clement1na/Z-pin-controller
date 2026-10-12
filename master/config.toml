@@ -24,21 +24,21 @@ baud = 115200
 travel_mm = 50.0          # nominal slide travel; NOT the software work window
 firmware_verified = false # set true only after flashing and checking protocol 2 firmware
 datum_confirmed = false  # set true only after measuring the signed useful window
-# Initial software zero is manually confirmed at the top of the reserved window.
+# Initial software zero is manually confirmed before the 10 mm preparation.
 # Automatic insertion_mm is DERIVED: standby_mm-depth/cos(theta). Custom uses
 # the explicit slide travel within the confirmed window. Depth is measured
 # perpendicular to the tube wall. A value written here is ignored.
-# work_min_mm = -10.0     # example only: actual safe down limit must be measured
-# standby_mm = -5.0      # reserve 5 mm before CNC touch-off; software zero stays unchanged
-# work_max_mm = 0.0       # unchanged firmware window: [-10, 0]
+# work_min_mm = -15.0     # firmware guard; actual mechanical clearance must be checked
+# standby_mm = -10.0     # reserve 10 mm before CNC touch-off; software zero stays unchanged
+# work_max_mm = 15.0      # current firmware software window: [-15, 15]
 
 [cycle]
 valve_delay_ms = 500
-cut_clearance_mm = 5.0    # extra GX28 lift; B remains clamped until cutting is confirmed
+cut_clearance_mm = 10.0   # extra GX28 lift; B remains clamped until cutting is confirmed
 upper_release_after_retract = false  # legacy 0-clearance flow only; positive clearance waits for cutting
 
 # [job]                  # defaults; explicit --angle/--count/--depth override one run.
                          # One job is one row; the tube is turned by hand and the row repeats.
 # angle_deg = 15.0       # choose 0, 15 or 30 degrees; needles stay vertical
 # count = 7              # preset density 7/10/15; fixed 20 mm zone, fixed 10 mm needle pitch
-# depth_mm = 2.0         # perpendicular to the tube wall; limit 5 mm, also bound by slide window
+# depth_mm = 2.0         # perpendicular to tube wall; no process cap, slide window still enforced

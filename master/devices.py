@@ -441,6 +441,23 @@ class InsertHead:
         raise TimeoutError(f"滑台应答超时（等待 {keywords}），已收: {got[-3:]}")
 
     # ---- 业务 ----
+    def verify_work_window(self, motion) -> tuple[float, float]:
+        """Check the existing status command before motion, without enabling clamps."""
+        self._send("s")
+        lines = self._read_until(("工作窗口",), 3.0)
+        match = re.search(r"工作窗口\s*([-+\d.]+)\s*~\s*([-+\d.]+)\s*mm", lines[-1])
+        if not match:
+            raise RuntimeError("滑台固件工作窗口回话格式不对，未允许移动")
+        lower, upper = (float(match.group(i)) for i in (1, 2))
+        if not (math.isfinite(lower) and math.isfinite(upper) and lower < upper):
+            raise RuntimeError("滑台固件工作窗口无效，未允许移动")
+        if lower > motion.work_min_mm or upper < motion.work_max_mm:
+            raise RuntimeError(
+                f"滑台固件工作窗口为 [{lower:g}, {upper:g}] mm，"
+                f"当前配置需要 [{motion.work_min_mm:g}, {motion.work_max_mm:g}] mm；"
+                "请烧录本仓库当前 ESP32 固件后重新确认零位、对刀。独立气阀仍可操作")
+        return lower, upper
+
     def position_mm(self) -> float:
         self._send("s")
         lines = self._read_until(("当前位置",), 3.0)

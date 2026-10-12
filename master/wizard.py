@@ -14,11 +14,11 @@ from dataclasses import replace
 from pathlib import Path
 
 from master.devices import list_nics, list_serial_ports, rank_nics, rank_serial_ports
-from master.model import MAX_DEPTH_MM, MAX_CUT_CLEARANCE_MM, PRESET_ANGLES, PRESET_COUNTS, HeadMotion, PresetSpec, validate_cut_clearance_mm
+from master.model import DEFAULT_CUT_CLEARANCE_MM, HEAD_PRE_DESCENT_MM, HEAD_WORK_MIN_MM, HEAD_WORK_MAX_MM, MAX_CUT_CLEARANCE_MM, PRESET_ANGLES, PRESET_COUNTS, HeadMotion, PresetSpec, validate_cut_clearance_mm
 from master.planner import highest_work_z_mm, plan_preset_row
 
-# 对应固件 insert_head.ino 的 WORK_MIN_MM，是机械行程不是工艺参数，不问操作员。
-WORK_MIN_MM = -10.0
+# 对应固件 insert_head.ino 的下行软件限位；实际机械余量仍须人工确认。
+WORK_MIN_MM = HEAD_WORK_MIN_MM
 MIN_DIMENSION_MM = 0.001
 DEFAULT_LIMIT_MM = 400.0
 
@@ -257,10 +257,9 @@ def collect_preset(w: Wizard, geometry, *, defaults=None):
         default_angle = defaults.get("angle_deg", 15)
         angle = float(w.choose("架子角度 θ", tuple((str(a), f"{a}°") for a in PRESET_ANGLES),
                                default=_default_text(default_angle) if default_angle in PRESET_ANGLES else "15"))
-        depth = w.ask_float(f"植入深度 mm（垂直管面，不超过 {MAX_DEPTH_MM:g}）",
-                            minimum=MIN_DIMENSION_MM, maximum=MAX_DEPTH_MM,
-                            default=_default_text(defaults.get("depth_mm")),
-                            too_big=f"必须不大于 {MAX_DEPTH_MM:g} mm")
+        depth = w.ask_float("植入深度 mm（垂直管面；实际行程须在滑台工作窗口内）",
+                            minimum=MIN_DIMENSION_MM,
+                            default=_default_text(defaults.get("depth_mm")))
         try:
             row = PresetSpec(angle, count, depth)
             plan = plan_preset_row(row, geometry)
@@ -354,15 +353,18 @@ def wait_for_safe_height(w: Wizard, cnc, datum, plan) -> float:
 
 
 def prepare_head_for_touch_off(w: Wizard, head, motion: HeadMotion) -> bool:
-    """Reserve upward travel using the existing firmware's negative window."""
+    """Reserve cutting travel without changing the confirmed software zero."""
     w.say("=== GX28 对刀准备 ===")
-    w.say("先保持针尖离开工件，确认滑台从当前零点向下 5 mm 无障碍、金属丝未被夹紧。"
-          "程序将滑台移到 -5 mm，再进行 CNC 对刀；不会重新设置滑台零点。")
-    if not w.ask_yes_no("确认下方有 5 mm 余量，允许 GX28 向下准备？", default=False):
+    w.say(f"先保持针尖离开工件，确认滑台从当前零点向下 {HEAD_PRE_DESCENT_MM:g} mm 无障碍、金属丝未被夹紧。"
+          f"程序将滑台移到 {-HEAD_PRE_DESCENT_MM:g} mm，再进行 CNC 对刀；不会重新设置滑台零点。")
+    if not w.ask_yes_no(f"确认下方有 {HEAD_PRE_DESCENT_MM:g} mm 余量，允许 GX28 向下准备？", default=False):
         return False
     initial = head.position_mm()
     if not head.zero_confirmed or not math.isfinite(initial) or abs(initial) > 0.05:
         raise RuntimeError("GX28 对刀准备前必须在本次人工确认的 0 mm 位置；请重新核实零点")
+    verify = getattr(head, "verify_work_window", None)
+    if verify is not None:
+        verify(motion)
     head.valve("a", False)
     head.valve("b", False)
     head.motion = motion
@@ -378,11 +380,10 @@ def lift_head_after_touch_off(w: Wizard, head, motion: HeadMotion) -> tuple[Head
     position = head.position_mm()
     if not head.zero_confirmed or not math.isfinite(position) or abs(position-motion.standby_mm) > 0.05:
         raise RuntimeError("GX28 对刀时的位置已改变；请重新准备并对刀")
-    # Preserve the measured datum. Targets stay inside [-10, 0], so no new
-    # firmware commands or software zero change are needed.
+    # Preserve the measured datum and use ordinary absolute position commands.
     distance = w.ask_float("对刀已记录。GX28 可动针头上升多少 mm？（0关闭剪丝抬升）",
-                           minimum=0, maximum=min(MAX_CUT_CLEARANCE_MM, -position),
-                           default=f"{min(motion.cut_clearance_mm, -position):g}")
+                           minimum=0, maximum=min(MAX_CUT_CLEARANCE_MM, motion.work_max_mm-position),
+                           default=f"{min(motion.cut_clearance_mm, motion.work_max_mm-position):g}")
     lifted = replace(motion, standby_mm=position,
                      insertion_mm=position+motion.down_delta_mm,
                      cut_clearance_mm=distance)
@@ -464,19 +465,25 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
         row = source.build(cfg, {**preset_values(row), **(job_overrides or {})})
         plan = source.plan(row, geometry)
         env = _reconcile_limits(w, env, plan)
-        motion = _build_motion(row, cfg.get("cycle", {}).get("cut_clearance_mm", 5.0))
+        clearance = cfg.get("cycle", {}).get("cut_clearance_mm", DEFAULT_CUT_CLEARANCE_MM)
+        # Earlier preparations reserved only 5 mm. Offer the new default when
+        # redoing that setup; retain a chosen clearance from a 10 mm setup.
+        if cfg.get("head", {}).get("standby_mm") != -HEAD_PRE_DESCENT_MM:
+            clearance = DEFAULT_CUT_CLEARANCE_MM
+        motion = _build_motion(row, clearance)
         # 先落盘一次：即使后面在零点或对刀处中止，操作员选的端口/网卡也留下来了。
         _apply(cfg, env)
-        _apply(cfg, _local_sections(env, motion))
+        # Keep measured coordinates and confirmation flags untouched until
+        # touch-off, cutting clearance and the final assertions are complete.
         cfg["job"] = preset_values(row)
         write_local(local_path, cfg)
-        w.say(f"已保存接口与作业参数到 {local_path}（安全高度待本次实机确认）")
+        w.say(f"已保存接口与作业参数到 {local_path}（滑台窗口、对刀位与安全高度待本次实机确认）")
         echo = cli._make_echo(debug)
         devices = cli._open_live_devices(cfg, geometry, motion, echo=echo)
         cli._connect_live_devices(devices)
         w.say(f"连接后状态：CNC WPos={devices.cnc.position()}，"
               f"滑台软件读数={devices.head.position_mm():.3f} mm。")
-        w.say("GX28 的初始 0 mm 是预留区上端，随后准备到 -5 mm 才对刀。"
+        w.say(f"GX28 的初始 0 mm 是本次人工确认的位置，随后准备到 {-HEAD_PRE_DESCENT_MM:g} mm 才对刀。"
               "再次上电时仍须人工核实初始零点，不能把上次对刀位直接当作它。")
         if not confirm_zero_state(w, devices.servo, devices.head,
                                   lambda servo, head: cli._prepare_live_zeros(
@@ -547,16 +554,16 @@ def _reconcile_limits(w: Wizard, env: dict, plan) -> dict:
             limits = (x_max, y_max, limits[2])
 
 
-def _build_motion(row: PresetSpec, cut_clearance_mm=5.0) -> HeadMotion:
+def _build_motion(row: PresetSpec, cut_clearance_mm=DEFAULT_CUT_CLEARANCE_MM) -> HeadMotion:
     """下行目标由深度推导：深度沿垂直管面量，滑台竖直行程 = depth/cosθ。"""
     clearance = validate_cut_clearance_mm(cut_clearance_mm)
-    standby = -MAX_CUT_CLEARANCE_MM
+    standby = -HEAD_PRE_DESCENT_MM
     if standby-row.slide_travel_mm < WORK_MIN_MM:
         raise ValueError(f"滑台行程超出当前工作窗口：{row.angle_deg:g}°、深度 {row.depth_mm:g} mm "
                          f"需要下行 {row.slide_travel_mm:.3f} mm；从对刀位 {standby:g} mm "
                          f"最多可下行 {standby-WORK_MIN_MM:g} mm。未连接设备，请减小深度。")
     return HeadMotion(standby_mm=standby, insertion_mm=standby-row.slide_travel_mm,
-                      work_min_mm=WORK_MIN_MM, work_max_mm=0.0, datum_confirmed=True,
+                      work_min_mm=WORK_MIN_MM, work_max_mm=HEAD_WORK_MAX_MM, datum_confirmed=True,
                       cut_clearance_mm=clearance)
 
 

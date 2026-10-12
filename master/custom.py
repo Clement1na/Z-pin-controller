@@ -10,7 +10,7 @@ from pathlib import Path
 
 from master.coordinator import Coordinator, RunState
 from master.local_config import load_merged
-from master.model import MAX_DEPTH_MM, HeadMotion, MachineGeometry, validate_cut_clearance_mm
+from master.model import HeadMotion, MachineGeometry, validate_cut_clearance_mm
 from master.planner import Placement, RowPlan
 from master.wizard import WizardCancelled
 
@@ -128,7 +128,7 @@ class CustomController:
         clearance = (validate_cut_clearance_mm(self.cfg.get("cycle", {}).get("cut_clearance_mm", 0.0))
                      if for_injection else 0.0)
         if clearance and standby+clearance > hd["work_max_mm"]:
-            raise RuntimeError("剪丝上升空间尚未记录；请先在实机向导完成 GX28 -5 mm 准备、对刀及上升距离设置")
+            raise RuntimeError("剪丝上升空间尚未记录；请先在实机向导完成 GX28 -10 mm 准备、对刀及上升距离设置")
         if for_injection:
             safe = _finite(hd.get("cut_safe_mm", standby+clearance), "剪丝安全位置")
             if abs(safe-(standby+clearance)) > 0.05:
@@ -213,6 +213,9 @@ class CustomController:
             self.update({"travel_mm": travel})
         motion = self._motion()
         head = self._device("head")
+        verify = getattr(head, "verify_work_window", None)
+        if verify is not None:
+            verify(motion)
         head.motion = motion
         self._check()
         return head.move_mm(motion.insertion_mm)
@@ -226,6 +229,9 @@ class CustomController:
         self._ensure_cut_finished()
         motion = self._motion(standby_only=True)
         head = self._device("head")
+        verify = getattr(head, "verify_work_window", None)
+        if verify is not None:
+            verify(motion)
         head.motion = motion
         self._check()
         return head.move_mm(motion.standby_mm)
@@ -450,7 +456,7 @@ def run_custom_menu(*, store, selection, config_path, debug=False, menu=None,
                        controller.cnc_home, controller.cnc_unlock, controller.inject_once, controller.finish_cut, controller.stop)))
     try:
         menu.warn("每次上电必须重新核实实际机械零位；屏幕显示 0 不代表机械零位。")
-        menu.warn(f"自定义下针行程不采用预设的 {MAX_DEPTH_MM:g} mm 深度上限，必须按实际工装核实行程。")
+        menu.warn("植入深度没有固定上限；自定义输入为滑台下针行程，仍须在已确认的工作窗口内。")
         while not controller.cancel_event.is_set():
             menu.say(f"自定义参数：{controller.values}")
             menu.say(f"共用剪丝额外抬升：{controller.cfg.get('cycle', {}).get('cut_clearance_mm', 0)} mm。"

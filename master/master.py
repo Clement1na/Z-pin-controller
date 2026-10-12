@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT))
 
 from master.coordinator import Coordinator, RunState
 from master.local_config import load_merged, local_path_for, write_local
-from master.model import PRESET_ANGLES, HeadMotion, MachineGeometry, PresetSpec, validate_cut_clearance_mm
+from master.model import HEAD_WORK_MIN_MM, HEAD_WORK_MAX_MM, PRESET_ANGLES, HeadMotion, MachineGeometry, PresetSpec, validate_cut_clearance_mm
 from master.operator_gate import OperatorGate
 from master.planner import highest_work_z_mm, plan_at_y, plan_preset_row, work_z_mm
 from master.simulated import SimulationRig
@@ -99,9 +99,8 @@ def run_simulation(row: PresetSpec, *, inject_failure: bool = False, rows: int =
                    datum=SMOKE_DATUM, scan_z_mm: float = SMOKE_SCAN_Z_MM, plan=None) -> int:
     if plan is None:
         plan = plan_preset_row(row, _known_geometry())
-    motion = HeadMotion(standby_mm=-5, insertion_mm=-5-row.slide_travel_mm,
-                        work_min_mm=-10, work_max_mm=0, datum_confirmed=True,
-                        cut_clearance_mm=5)
+    from master.wizard import _build_motion
+    motion = _build_motion(row)
     rig = SimulationRig(standby_mm=motion.standby_mm, scan_z_mm=scan_z_mm,
                         fail_on_first_descent=inject_failure,
                         slope=plan.slope, datum=datum)
@@ -166,9 +165,8 @@ def _read_live_configuration(path: Path, confirmed: bool,
                         work_max_mm=required("head", "work_max_mm"),
                         datum_confirmed=required("head", "datum_confirmed"),
                         cut_clearance_mm=cut_clearance)
-    if not (-10 <= motion.work_min_mm <= motion.insertion_mm < motion.standby_mm <= 0
-            and motion.work_max_mm == 0):
-        raise ValueError("配置：head 必须使用负向下行窗口 [-10, 0]，对刀待机位与剪丝位置均不得高于 0 mm")
+    if not (HEAD_WORK_MIN_MM <= motion.work_min_mm < motion.work_max_mm <= HEAD_WORK_MAX_MM):
+        raise ValueError(f"配置：head 工作窗口必须位于固件限位 [{HEAD_WORK_MIN_MM:g}, {HEAD_WORK_MAX_MM:g}] mm 内")
     recorded_safe = cfg.get("head", {}).get("cut_safe_mm", motion.cut_position_mm)
     if (isinstance(recorded_safe, bool) or not isinstance(recorded_safe, (int, float))
             or not math.isfinite(recorded_safe) or abs(recorded_safe-motion.cut_position_mm) > 0.05):
