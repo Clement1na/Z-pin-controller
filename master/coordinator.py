@@ -140,13 +140,28 @@ class Coordinator:
         self._check_cancel()
         self._check_head_position()
         if abs(self.head.position_mm() - self.motion.standby_mm) > 0.05:
-            # The wizard leaves GX28 at the recorded cutting height. Restore
-            # the touch-off datum before the first insertion, with clamps open.
+            # Lower only after the CNC has reached the next insertion position.
             self.head.valve("a", False)
             self.head.valve("b", False)
             self._delay()
             self.head.move_mm(self.motion.standby_mm)
             self._check_cancel()
+
+    def _prepare_travel(self) -> None:
+        """Keep the head at the recorded cutting height throughout CNC travel."""
+        self._check_cancel()
+        self._check_head_position()
+        if abs(self.head.position_mm() - self.motion.cut_position_mm) > 0.05:
+            self.head.valve("a", False)
+            self.head.valve("b", False)
+            self._delay()
+            self.head.move_mm(self.motion.cut_position_mm)
+            self._check_cancel()
+        position = self.head.position_mm()
+        if (not self.head.zero_confirmed or not math.isfinite(position)
+                or abs(position - self.motion.cut_position_mm) > 0.05):
+            raise RuntimeError("滑台未到已记录的剪丝安全位；未移动 CNC")
+        self._check_cancel()
 
     def _position_servo(self, target_mm) -> None:
         if self.servo_required:
@@ -211,15 +226,14 @@ class Coordinator:
             self.head.valve("b", False)
 
     def _finish_cut(self) -> None:
-        """Called only after cutting is confirmed; never lower on cancel or failure."""
+        """Release the upper clamp after confirmation and hold the cutting height."""
         self._check_cancel()
         position = self.head.position_mm()
         if (not self.head.zero_confirmed or not math.isfinite(position)
                 or abs(position-self.motion.cut_position_mm) > 0.05):
-            raise RuntimeError("剪丝等待位置或滑台零位已改变；未自动下降，请重新核实位置")
+            raise RuntimeError("剪丝等待位置或滑台零位已改变；未进入下一动作，请重新核实位置")
         self.head.valve("b", False)
         self._delay()
-        self.head.move_mm(self.motion.standby_mm)
         self._check_cancel()
 
     def _run_one_row(self, plan: RowPlan, row: int, total: int) -> None:
@@ -234,9 +248,11 @@ class Coordinator:
             self._check_cancel()
             self._notify("placement_started", row, index, total, placement)
             try:
+                self._prepare_travel()
                 self.cnc.move_to(placement.cnc_x_mm, placement.cnc_y_mm,
                                  work_z_mm(plan, placement.cnc_x_mm, self.z_datum))
                 self._check_cancel()
+                self._prepare_standby()
                 self._cycle_one()
             except BaseException as exc:
                 # 落点中途失败或急停：必须留下一行，否则"跑到哪了"无从查起。
@@ -279,13 +295,13 @@ class Coordinator:
             self._check_cancel()
             self._position_servo(plan.servo_target_mm)
             self._check_cancel()
-            self._prepare_standby()
             while True:
                 self._run_one_row(plan, completed_rows, total)
                 completed_rows += 1
                 if confirm_next_row is None:
                     break
                 # 排间回到安全高度再回排头：自转重复是"一模一样的一排"。
+                self._prepare_travel()
                 self.cnc.move_to(head.cnc_x_mm, head.cnc_y_mm, self.scan_z_mm)
                 self._check_cancel()
                 self.state = RunState.WAITING_OPERATOR

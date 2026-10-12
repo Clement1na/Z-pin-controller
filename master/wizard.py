@@ -384,7 +384,7 @@ def lift_head_after_touch_off(w: Wizard, head, motion: HeadMotion) -> tuple[Head
     if not math.isfinite(readback) or abs(readback-lifted.cut_position_mm) > 0.05:
         raise RuntimeError("GX28 上升后位置回读不一致，未记录安全位置")
     w.say(f"已记录 GX28 对刀位 {position:g} mm、上升 {distance:g} mm、剪丝安全位置 {readback:g} mm。"
-          "开始植入时先下降回对刀位；此位置与 CNC 排间 Z 安全高度分别记录。")
+          "CNC 到植入位置后才下降回对刀位；此位置与 CNC 排间 Z 安全高度分别记录。")
     return lifted, readback
 
 

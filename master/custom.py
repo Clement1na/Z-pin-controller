@@ -139,7 +139,7 @@ class CustomController:
 
     def _ensure_cut_finished(self):
         if self._cut_coordinator is not None:
-            raise RuntimeError("正在等待剪丝；请先执行‘剪丝完成，恢复待机’，再移动或重新设零")
+            raise RuntimeError("正在等待剪丝；请先执行‘剪丝完成，松上阀并保持安全位’，再移动或重新设零")
 
     def _check(self):
         if self._closed or self.cancel_event.is_set():
@@ -247,14 +247,6 @@ class CustomController:
 
     def cnc_move_to(self, x_mm=None, y_mm=None, z_mm=None):
         self.update({f"{axis}_mm": value for axis, value in zip("xyz", (x_mm, y_mm, z_mm)) if value is not None})
-        cn = self.cfg.get("cnc3d", {})
-        for axis in "xyz":
-            if not isinstance(cn, dict) or f"{axis}_max" not in cn:
-                raise RuntimeError(f"请先设置 CNC {axis.upper()} 安全上限")
-            limit = _finite(cn[f"{axis}_max"], f"CNC {axis.upper()} 上限")
-            value = self.values[f"{axis}_mm"]
-            if limit <= 0 or (axis in "xy" and value < 0) or value > limit:
-                raise ValueError(f"CNC {axis.upper()} 目标超出工作范围")
         return self._call("cnc", "move_to", *(self.values[f"{axis}_mm"] for axis in "xyz"))
 
     def cnc_home(self): return self._call("cnc", "home")
@@ -291,7 +283,7 @@ class CustomController:
         if result.state is RunState.WAITING_OPERATOR:
             self._cut_coordinator = coordinator
             message = (f"GX28 已额外上抬 {motion.cut_clearance_mm:g} mm，电机保持使能，B 阀保持夹紧。"
-                       "剪丝后让双手离开，再执行‘剪丝完成，恢复待机’。")
+                       "剪丝后让双手离开，再执行‘剪丝完成，松上阀并保持安全位’。")
             if self.menu is not None:
                 self.menu.say(message)
             else:
@@ -310,11 +302,11 @@ class CustomController:
         head = self.devices.head
         position = head.position_mm()
         if not head.zero_confirmed or not math.isfinite(position) or abs(position - coordinator.motion.cut_position_mm) > 0.05:
-            raise RuntimeError("剪丝等待位置或滑台零位已改变；未自动下降，请重新核实机械位置")
+            raise RuntimeError("剪丝等待位置或滑台零位已改变；未进入下一动作，请重新核实机械位置")
         result = coordinator.finish_single_cut()
         if result.state is not RunState.COMPLETE:
             self.stop()
-            raise RuntimeError(result.error or "剪丝后恢复待机失败")
+            raise RuntimeError(result.error or "剪丝后释放上阀失败")
         self._cut_coordinator = None
         return result
 
@@ -445,7 +437,7 @@ def run_custom_menu(*, store, selection, config_path, debug=False, menu=None,
         ("19", "CNC 移动到 XYZ"), ("20", "CNC 回零"), ("21", "CNC 解锁"),
         ("22", "CNC 当前位置"), ("23", "单次注入（保持 CNC 当前坐标）"),
         ("24", "保存自定义配置"), ("25", "加载自定义配置"), ("26", "列出自定义配置"),
-        ("27", "剪丝完成，松开上阀并恢复滑台待机"),
+        ("27", "剪丝完成，松开上阀并保持剪丝安全位"),
         ("!", "全机停止"), ("0", "退出（Q 也可退出）"))
     simple = dict(zip(("2", "3", "4", "5", "6", "8", "9", "10", "11", "12", "13",
                        "18", "20", "21", "23", "27", "!"),
@@ -460,7 +452,7 @@ def run_custom_menu(*, store, selection, config_path, debug=False, menu=None,
         while not controller.cancel_event.is_set():
             menu.say(f"自定义参数：{controller.values}")
             menu.say(f"共用剪丝额外抬升：{controller.cfg.get('cycle', {}).get('cut_clearance_mm', 0)} mm。"
-                     "启用后单次植入会等待剪丝，选择27确认后松阀并下降；未确认不能开始下一次。")
+                     "启用后单次植入会等待剪丝，选择27确认后松阀并保持剪丝安全位；下一次植入才下降，未确认不能开始下一次。")
             hd = controller.cfg.get("head", {})
             menu.say(f"滑台工作窗口：[{hd.get('work_min_mm', '未设置')}, "
                      f"{hd.get('work_max_mm', '未设置')}] mm；待机位：{hd.get('standby_mm', '未设置')} mm；"
