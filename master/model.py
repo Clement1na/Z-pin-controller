@@ -9,9 +9,9 @@ from dataclasses import dataclass
 # the actual mechanical zero and available travel before motion.
 HEAD_WORK_MIN_MM = -30.0
 HEAD_WORK_MAX_MM = 30.0
-HEAD_PRE_DESCENT_MM = 10.0
-DEFAULT_CUT_CLEARANCE_MM = 10.0
-MAX_CUT_CLEARANCE_MM = 10.0
+HEAD_PRE_DESCENT_MM = 15.0
+DEFAULT_CUT_CLEARANCE_MM = 15.0
+MAX_CUT_CLEARANCE_MM = 15.0
 
 
 def validate_cut_clearance_mm(value: float) -> float:

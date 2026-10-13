@@ -441,8 +441,8 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
         row = source.build(cfg, {**preset_values(row), **(job_overrides or {})})
         plan = source.plan(row, geometry)
         clearance = cfg.get("cycle", {}).get("cut_clearance_mm", DEFAULT_CUT_CLEARANCE_MM)
-        # Earlier preparations reserved only 5 mm. Offer the new default when
-        # redoing that setup; retain a chosen clearance from a 10 mm setup.
+        # Earlier preparations reserved only 5 or 10 mm. Offer the new default
+        # when redoing those setups; retain choices from a 15 mm preparation.
         if cfg.get("head", {}).get("standby_mm") != -HEAD_PRE_DESCENT_MM:
             clearance = DEFAULT_CUT_CLEARANCE_MM
         motion = _build_motion(row, clearance)
