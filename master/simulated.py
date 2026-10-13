@@ -51,6 +51,16 @@ class _Servo:
         self.origin_count = None
 
     @property
+    def position_mm(self) -> float:
+        if self.origin_count is None:
+            raise RuntimeError("伺服逻辑零位尚未设置")
+        return self.position - self.origin_count
+
+    @property
+    def raw_position_mm(self) -> float:
+        return self.position
+
+    @property
     def setup_offset_mm(self) -> float:
         return self.position - self.boot_position
 

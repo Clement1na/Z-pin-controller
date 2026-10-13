@@ -159,7 +159,9 @@ class ProfileStore:
                 custom: str | None = None) -> dict:
         base = load_merged(Path(template))
         if machine:
-            base = _overlay(base, self.load("machines", machine))
+            machine_values = self.load("machines", machine)
+            base.pop("saved_touch_off", None)
+            base = _overlay(base, machine_values)
         if custom:
             base = _overlay(base, self.load("custom", custom))
         return base

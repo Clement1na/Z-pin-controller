@@ -15,7 +15,7 @@ from pathlib import Path
 
 from master.devices import list_nics, list_serial_ports, rank_nics, rank_serial_ports
 from master.model import DEFAULT_CUT_CLEARANCE_MM, HEAD_PRE_DESCENT_MM, HEAD_WORK_MIN_MM, HEAD_WORK_MAX_MM, MAX_CUT_CLEARANCE_MM, PRESET_ANGLES, PRESET_COUNTS, HeadMotion, PresetSpec, validate_cut_clearance_mm
-from master.planner import highest_work_z_mm, plan_preset_row
+from master.planner import highest_work_z_mm, plan_at_x, plan_preset_row
 
 # 对应固件 insert_head.ino 的下行软件限位；实际机械余量仍须人工确认。
 WORK_MIN_MM = HEAD_WORK_MIN_MM
@@ -446,6 +446,22 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
         if cfg.get("head", {}).get("standby_mm") != -HEAD_PRE_DESCENT_MM:
             clearance = DEFAULT_CUT_CLEARANCE_MM
         motion = _build_motion(row, clearance)
+        from master.touch_off import SECTION, make_record, read_record, restore_position
+        try:
+            saved_point = read_record(cfg, row, plan)
+        except ValueError as exc:
+            w.warn(f"已保存对刀点不能复用：{exc}；本次重新对刀。")
+            saved_point = None
+        reuse = False
+        if saved_point is not None:
+            xyz, saved_motion, saved_z = saved_point
+            reuse = w.choose(
+                f"已保存对刀点 X={xyz[0]:g} Y={xyz[1]:g} Z={xyz[2]:g} mm，"
+                f"安全Z={saved_z:g} mm。仅在工件、针组与CNC工作坐标基准未变化时复用。"
+                "复用会先在滑台0位抬CNC至安全高度，再定位排头；开机零位仍须确认。",
+                (("reuse", "使用已保存对刀点"), ("new", "新建／重新对刀")), default="new") == "reuse"
+            if reuse:
+                motion = saved_motion
         # 先落盘一次：即使后面在零点或对刀处中止，操作员选的端口/网卡也留下来了。
         _apply(cfg, env)
         # Keep measured coordinates and confirmation flags untouched until
@@ -455,6 +471,10 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
         w.say(f"已保存接口与作业参数到 {local_path}（滑台窗口、对刀位与安全高度待本次实机确认）")
         echo = cli._make_echo(debug)
         devices = cli._open_live_devices(cfg, geometry, motion, echo=echo)
+        setup_cancel = getattr(command_reader, "cancel_event", None)
+        if setup_cancel is not None:
+            for device in (devices.servo, devices.cnc, devices.head):
+                device.cancel_event = setup_cancel
         cli._connect_live_devices(devices)
         w.say(f"连接后状态：CNC WPos={devices.cnc.position()}，"
               f"滑台软件读数={devices.head.position_mm():.3f} mm。")
@@ -466,19 +486,35 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
                                   servo_required=False):
             w.warn("未完成零点确认，未开始自动植入。")
             return 1
-        if not prepare_head_for_touch_off(w, devices.head, motion):
-            w.warn("未允许 GX28 对刀准备，未移动针头或开始自动植入。")
-            return 1
-        touch_off = wait_for_work_datum(w, devices.cnc, include_y=True)
+        save_point = False
+        if reuse:
+            touch_off, motion, scan_z = saved_point
+            w.say("使用已保存对刀点；正在恢复排头安全位置，不重新定义设备零位。")
+            restore_position(devices.cnc, devices.head, touch_off, motion, scan_z)
+            cut_safe = motion.cut_position_mm
+        else:
+            if not prepare_head_for_touch_off(w, devices.head, motion):
+                w.warn("未允许 GX28 对刀准备，未移动针头或开始自动植入。")
+                return 1
+            touch_off = wait_for_work_datum(w, devices.cnc, include_y=True)
+            motion, cut_safe = lift_head_after_touch_off(w, devices.head, motion)
         datum = (touch_off[0], touch_off[2])
         row_y = touch_off[1]
-        motion, cut_safe = lift_head_after_touch_off(w, devices.head, motion)
-        scan_z = wait_for_safe_height(w, devices.cnc, datum, plan)
+        plan = plan_at_x(plan, touch_off[0])
+        if not reuse:
+            scan_z = wait_for_safe_height(w, devices.cnc, datum, plan)
+            save_point = w.ask_yes_no(
+                f"是否保存本次对刀点 X={touch_off[0]:g} Y={row_y:g} Z={touch_off[2]:g} mm？"
+                "同时记忆排间安全Z及滑台剪丝位置，下次植入可直接选择使用。", default=True)
         confirm_assertions(w)
         _apply(cfg, _local_sections(env, motion, scan_z))
         cfg["head"]["cut_safe_mm"] = cut_safe
+        if save_point:
+            cfg[SECTION] = make_record(cfg, row, touch_off, motion, scan_z)
         write_local(local_path, cfg)
         w.say(f"已写入 {local_path}（含 scan_z_mm={scan_z:g} mm）")
+        if save_point:
+            w.say("已保存对刀点；下次植入可选择使用已保存对刀点或重新对刀。")
         if profile_store is not None and profile_selection:
             machine = profile_selection.get("machine")
             if machine:
@@ -489,7 +525,7 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
         # 用写出的文件重新校验一遍：写出器的 bug 必须在这里暴露，而不是在运动中途。
         cfg2, row2, _, motion2, scan_z2, plan2, datum2 = cli._read_live_configuration(
             config_path, True, preset_values(row), datum=datum, job_source=source,
-            row_y_mm=row_y)
+            row_y_mm=row_y, row_x_mm=touch_off[0])
         _check_consistency(cfg, cfg2)
         w.say(f"最终参数：{row2.x_count} 个植入点，{len(plan2.placements)} 次扎针动作（每次两针），"
               f"针距 {plan2.needle_pitch_mm:g} mm 伺服 {plan2.servo_target_mm:g} mm，"

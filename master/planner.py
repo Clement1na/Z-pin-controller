@@ -78,6 +78,16 @@ def work_z_mm(plan: RowPlan, cnc_x_mm: float, datum: tuple[float, float]) -> flo
     return z0 + (cnc_x_mm - x0) * plan.slope
 
 
+def plan_at_x(plan: RowPlan, x_mm: float) -> RowPlan:
+    """Place the preset's local row origin at the confirmed touch-off X."""
+    if isinstance(x_mm, bool) or not isinstance(x_mm, (int, float)) or not math.isfinite(x_mm):
+        raise ValueError("对刀 X 必须是有限数")
+    return replace(plan, placements=tuple(
+        replace(p, cnc_x_mm=p.cnc_x_mm+x_mm,
+                needle_hits=tuple((x+x_mm, y) for x, y in p.needle_hits))
+        for p in plan.placements))
+
+
 def plan_at_y(plan: RowPlan, y_mm: float) -> RowPlan:
     """Bind relative row Y coordinates to this setup's measured touch-off Y."""
     if isinstance(y_mm, bool) or not isinstance(y_mm, (int, float)) or not math.isfinite(y_mm):

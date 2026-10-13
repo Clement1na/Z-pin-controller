@@ -8,8 +8,9 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 
-from master.gui.menu import parse_float
+from master.gui.menu import _Dialog, parse_float
 from master.coordinator import RunState
+from master.wizard import WizardCancelled
 
 _ACTION_LABELS = {
     "servo_pitch": "针距移动", "servo_enable": "伺服使能", "servo_set_zero": "伺服设零",
@@ -100,6 +101,8 @@ class CustomPage(tk.Toplevel):
             debug=debug, menu=menu, prepared_config=deepcopy(prepared_config)))
         self._busy = True
         self._closing = False
+        self._exit_requested = False
+        self._exit_check_pending = False
         self._buttons = []
         self.values = {key: tk.StringVar(self, value=value) for key, value in (
             ("needle_pitch_mm", "10"), ("travel_mm", "2"),
@@ -183,7 +186,7 @@ class CustomPage(tk.Toplevel):
         self.warnings_label.pack(anchor="w", pady=4)
 
         controls = self._group(body, "会话", 1, 2)
-        ttk.Button(controls, text="急停并结束会话", command=self.close).pack(fill="x", pady=2)
+        ttk.Button(controls, text="急停并结束会话", command=self._close_session).pack(fill="x", pady=2)
         ttk.Button(controls, text="关闭并清理设备", command=self.close).pack(fill="x", pady=2)
         ttk.Label(body, textvariable=self.status, wraplength=850).grid(
             row=2, column=0, columnspan=3, sticky="w", padx=4, pady=8)
@@ -205,7 +208,7 @@ class CustomPage(tk.Toplevel):
         return name
 
     def _request(self, action, capture=None):
-        if self._busy or self._closing:
+        if self._busy or self._closing or self._exit_requested:
             return
         try:
             captured = capture() if capture is not None else ()
@@ -224,7 +227,7 @@ class CustomPage(tk.Toplevel):
 
     def _sync_buttons(self):
         for button in self._buttons:
-            button.configure(state="disabled" if self._busy or self._closing else "normal")
+            button.configure(state="disabled" if self._busy or self._closing or self._exit_requested else "normal")
 
     def _note(self, text, *, error=False):
         self.status.set(text)
@@ -241,6 +244,10 @@ class CustomPage(tk.Toplevel):
                 self.destroy()
                 return
             self._busy = False
+            if action in ("servo_exit_status", "servo_return_zero"):
+                self._handle_exit_result(action, value, error)
+                self._sync_buttons()
+                continue
             label = _ACTION_LABELS.get(action, "操作")
             if error is not None:
                 self._note(f"{label}失败：{error}", error=True)
@@ -283,9 +290,81 @@ class CustomPage(tk.Toplevel):
                 else:
                     self._note(f"{label}完成" + (f"：{value}" if value is not None else ""))
             self._sync_buttons()
+        if self._exit_requested and not self._busy and not self._closing and not self._exit_check_pending:
+            self._begin_exit_check()
         self.after(50, self._poll)
 
     def close(self):
+        if self._closing or self._exit_requested:
+            return
+        self._exit_requested = True
+        if self._busy:
+            self._sync_buttons()
+            self.status.set("等待当前动作结束后检查伺服归零；需要立即停止请使用急停。")
+            return
+        self._begin_exit_check()
+
+    def _begin_exit_check(self):
+        if self._session.cancel_event is not None and self._session.cancel_event.is_set():
+            self._close_session()
+            return
+        self._exit_check_pending = True
+        self._busy = True
+        self._sync_buttons()
+        self.status.set("正在检查伺服实际位置是否回到针距10 mm…")
+        self._session.submit("servo_exit_status")
+
+    def _choose_exit(self, status):
+        pitch = status.get("pitch_mm")
+        detail = (f"当前实际针距约 {pitch:g} mm。" if pitch is not None
+                  else status.get("reason", "无法确认实际位置。"))
+        box = _Dialog(self, "伺服未归零（目标针距10 mm）。\n" + detail)
+        if self.menu is not None:
+            box._owner = self.menu
+            self.menu._active_dialogs.append(box)
+        with box:
+            for key, label in (("home", "归零后退出"), ("cancel", "取消"), ("force", "强制退出")):
+                box.add_choice(key, label, focus=key == "cancel")
+            box.add_buttons(show_ok=False, show_cancel=False)
+        return box.result
+
+    def _cancel_exit(self):
+        self._exit_requested = False
+        self._exit_check_pending = False
+        self._busy = False
+        self._sync_buttons()
+
+    def _handle_exit_result(self, action, value, error):
+        self._exit_check_pending = False
+        if action == "servo_return_zero":
+            if error is not None or not isinstance(value, dict) or not value.get("at_zero"):
+                self._cancel_exit()
+                self._note(f"伺服归零失败，窗口保持打开：{error or '未确认实际针距10 mm'}", error=True)
+            else:
+                self._close_session()
+            return
+        status = value if error is None and isinstance(value, dict) else {
+            "at_zero": False, "reason": str(error or "伺服位置查询失败")}
+        if status.get("at_zero"):
+            self._close_session()
+            return
+        try:
+            choice = self._choose_exit(status)
+        except WizardCancelled:
+            choice = "cancel"
+        if choice == "force":
+            self._note("强制退出：未执行伺服归零，请在下次使用前人工确认10 mm针距。", error=True)
+            self._close_session()
+        elif choice == "home":
+            self._busy = True
+            self._exit_check_pending = True
+            self.status.set("正在归零到针距10 mm，成功后退出…")
+            self._session.submit("servo_return_zero")
+        else:
+            self._cancel_exit()
+            self._note("已取消退出，返回完全自定义控制。")
+
+    def _close_session(self):
         self._closing = True
         self._session.close()
         self._sync_buttons()

@@ -81,6 +81,8 @@ class CustomController:
         self.devices = LiveDevices(*(UnavailableDevice(name, "尚未连接")
                                      for name in ("伺服", "CNC", "滑台")))
         self._constructed = set()
+        self._servo_used = False
+        self._servo_reference = None
         self._factory = device_factory
         self.cancel_event = cancel_event if cancel_event is not None else threading.Event()
         self._closed = False
@@ -147,6 +149,8 @@ class CustomController:
 
     def _device(self, name):
         self._check()
+        if name == "servo":
+            self._servo_used = True
         if name not in self._constructed:
             if self._factory is not None:
                 self.devices = self._factory(cfg=self.cfg, geometry=self.geometry, motion=None, debug=self.debug)
@@ -197,9 +201,59 @@ class CustomController:
         return self._call("servo", "move_mm", servo_target_from_pitch(self.values["needle_pitch_mm"], self.geometry))
 
     def servo_enable(self): return self._call("servo", "enable")
-    def servo_set_zero(self): return self._call("servo", "set_zero")
+    def servo_set_zero(self):
+        result = self._call("servo", "set_zero")
+        servo = self.devices.servo
+        self._servo_reference = (servo, getattr(servo, "dev", servo), servo.origin_count,
+                                 _finite(servo.raw_position_mm, "伺服原始位置"))
+        return result
     def servo_release(self): return self._call("servo", "disable")
     def servo_reset_fault(self): return self._call("servo", "reset_fault")
+
+    def _servo_exit_position(self):
+        servo = self.devices.servo
+        if not servo.connected:
+            raise RuntimeError("伺服未连接，无法确认针距10 mm")
+        reference = self._servo_reference
+        if servo.origin_count is None and not (reference is not None and reference[0] is servo
+                                               and reference[1] is getattr(servo, "dev", servo)):
+            raise RuntimeError("伺服逻辑零位未确认或连接已改变；请先人工核对10 mm针距并设零")
+        drive = getattr(servo, "dev", None)
+        if drive is not None:
+            status = drive.status
+            if not status.get("wkc_ok") or status.get("sw", 0) & 0x0008:
+                raise RuntimeError("伺服链路或驱动故障，无法确认针距10 mm")
+        if servo.origin_count is not None:
+            return _finite(servo.position_mm, "伺服实际位置")
+        return _finite(servo.raw_position_mm, "伺服原始位置") - reference[3]
+
+    def servo_exit_status(self):
+        """Read the live position; never connect an otherwise unused servo."""
+        self._check()
+        if not self._servo_used:
+            return {"at_zero": True, "checked": False}
+        try:
+            position = self._servo_exit_position()
+        except Exception as exc:
+            return {"at_zero": False, "checked": True, "reason": str(exc)}
+        return {"at_zero": abs(position) <= 0.05, "checked": True,
+                "position_mm": position, "pitch_mm": self.geometry.station_width_mm-position}
+
+    def servo_return_zero(self):
+        """Return to an already confirmed reference, including after release."""
+        self._check()
+        self._ensure_cut_finished()
+        self._servo_exit_position()  # no new connection or arbitrary re-zero
+        servo = self.devices.servo
+        if servo.origin_count is None:
+            servo.origin_count = self._servo_reference[2]
+        servo.enable()
+        servo.move_mm(0.0)
+        result = self.servo_exit_status()
+        if not result["at_zero"]:
+            raise RuntimeError(f"伺服归零回读未确认10 mm针距：{result.get('reason', result.get('pitch_mm'))}")
+        self.values["needle_pitch_mm"] = self.geometry.station_width_mm
+        return result
 
     def servo_jog_setup(self, delta):
         delta = _finite(delta, "点动距离")

@@ -17,7 +17,7 @@ from master.coordinator import Coordinator, RunState
 from master.local_config import load_merged, local_path_for, write_local
 from master.model import HEAD_WORK_MIN_MM, HEAD_WORK_MAX_MM, PRESET_ANGLES, HeadMotion, MachineGeometry, PresetSpec, validate_cut_clearance_mm
 from master.operator_gate import OperatorGate
-from master.planner import highest_work_z_mm, plan_at_y, plan_preset_row, work_z_mm
+from master.planner import highest_work_z_mm, plan_at_x, plan_at_y, plan_preset_row, work_z_mm
 from master.simulated import SimulationRig
 
 
@@ -129,7 +129,7 @@ def run_simulation(row: PresetSpec, *, inject_failure: bool = False, rows: int =
 def _read_live_configuration(path: Path, confirmed: bool,
                              job_overrides: dict[str, float] | None = None, *,
                              datum: tuple[float, float] | None = None, job_source=None,
-                             row_y_mm: float | None = None):
+                             row_y_mm: float | None = None, row_x_mm: float | None = None):
     if not confirmed:
         raise ValueError("配置：实机模式必须给出 --confirm-datum")
     # 模板 + 同级的 config.local.toml（向导生成）。本机文件不存在时完全等价于只读模板。
@@ -178,6 +178,8 @@ def _read_live_configuration(path: Path, confirmed: bool,
             or not math.isfinite(scan_z)):
         raise ValueError("配置：scan_z_mm 必须是有限数")
     plan = source.plan(row, geometry)
+    if row_x_mm is not None:
+        plan = plan_at_x(plan, row_x_mm)
     if row_y_mm is not None:
         plan_at_y(plan, row_y_mm)  # 仍验证对刀 Y 为有限数；实际绑定在运行时进行。
     # 排间安全高度必须高过排内**最高**的工作点。theta 带符号：正角时最高点在排尾、
@@ -552,7 +554,7 @@ def _execute_live_job(cfg: dict, row: PresetSpec, motion: HeadMotion, scan_z: fl
         return turn_gate.wait_for_turn(completed_rows, cancel)
 
     print((f"实时运行：每次退针后 GX28 额外上抬 {motion.cut_clearance_mm:g} mm，B 阀保持夹紧；"
-           "剪丝完成并让双手离开后按回车，松开 B 阀并恢复滑台待机。最后一次同样需要确认；"
+           "剪丝完成并让双手离开后按回车，松开 B 阀并保持剪丝安全位。最后一次同样需要确认；"
            if motion.cut_clearance_mm else
            "实时运行：每次两针退回且 B 阀排气后，请剪丝并按回车移动到下一落点；")
           + "一排跑完后 CNC 抬到安全高度并回到排头，转管后按回车继续下一排；"
