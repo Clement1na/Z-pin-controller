@@ -24,7 +24,7 @@ from tkinter import font as tkfont
 from tkinter import messagebox, scrolledtext, ttk
 
 from master.gui.menu import TkMenu
-from master.gui.runner import CONTINUE, FINISH_ROW, STOP, RunController
+from master.gui.runner import CONTINUE, FINISH_ROW, REPEAT, STOP, RunController
 from master.profiles import ProfileStore
 from master.wizard import WizardCancelled
 
@@ -117,6 +117,9 @@ class MainWindow:
             bottom, text="继续", state="disabled",
             command=lambda: self._post(CONTINUE, "已发送确认继续。"))
         self.continue_button.pack(side="left")
+        self.repeat_button = ttk.Button(bottom, text="原位重做本次植入", state="disabled",
+                                        command=self._repeat_current)
+        self.repeat_button.pack(side="left", padx=(6, 0))
         self.finish_button = ttk.Button(
             bottom, text="排间收工", state="disabled",
             command=lambda: self._post(FINISH_ROW, "已请求排间正常收工。"))
@@ -190,6 +193,8 @@ class MainWindow:
         for button in (self.stop_button, self.continue_button, self.finish_button):
             if str(button.cget("state")) != state:
                 button.configure(state=state)
+        if hasattr(self, "repeat_button"):
+            self.repeat_button.configure(state="normal" if self.runner.cut_waiting else "disabled")
         wanted = "运行中" if self.runner.running else "空闲"
         if self.status.get() != wanted:
             self.status.set(wanted)
@@ -211,6 +216,19 @@ class MainWindow:
     def _post(self, command: str, message: str) -> None:
         if self.runner.post(command):
             self._note(message)
+
+    def _repeat_current(self):
+        if not self.runner.cut_waiting:
+            self._note("仅在等待剪丝时可原位重做。")
+            return
+        try:
+            confirmed = self.menu.ask_yes_no(
+                "原位重做本次植入？请先处理好金属丝，确认当前点可重做并让双手离开。"
+                "CNC和伺服不重新定位，沿用本次下针参数，完成后再次等待剪丝。", default=False)
+        except WizardCancelled:
+            return
+        if confirmed:
+            self._post(REPEAT, "已请求原位重做本次植入；完成后仍需剪丝确认。")
 
     def _stop(self) -> None:
         if not self.runner.post(STOP):

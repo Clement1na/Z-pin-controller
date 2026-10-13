@@ -100,12 +100,30 @@ class GuiCommandReader:
     def __init__(self) -> None:
         self._pending: queue.Queue[str] = queue.Queue()
         self.cancel_event = threading.Event()
+        self._state_lock = threading.Lock()
+        self._cut_waiting = False
 
-    def post(self, command: str) -> None:
+    @property
+    def cut_waiting(self):
+        with self._state_lock:
+            return self._cut_waiting
+
+    def set_cut_waiting(self, waiting):
+        with self._state_lock:
+            self._cut_waiting = bool(waiting)
+
+    def post(self, command: str) -> bool:
         """界面线程调用：投一条指令给正在跑的那次运行。"""
+        from master.operator_gate import REPEAT
+        with self._state_lock:
+            if command.strip().upper() == REPEAT and not self._cut_waiting:
+                return False
+            if command.strip().upper() == REPEAT or command.strip() == "":
+                self._cut_waiting = False
         if command.strip() == '!':
             self.cancel_event.set()
         self._pending.put(command)
+        return True
 
     def __call__(self, commands: queue.Queue, *, echo=None,
                  stopped: threading.Event | None = None) -> None:

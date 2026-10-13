@@ -13,6 +13,7 @@ from __future__ import annotations
 import threading
 
 from master.gui.stream import GuiCommandReader
+from master.operator_gate import REPEAT
 
 # 运行期指令，与终端里敲的三个约定完全一致（见 master.master._execute_live_job
 # 的分派循环）。界面按钮投的就是这三个。
@@ -33,6 +34,12 @@ class RunController:
     def running(self) -> bool:
         with self._lock:
             return self._running
+
+    @property
+    def cut_waiting(self) -> bool:
+        with self._lock:
+            reader = self._reader if self._running else None
+        return reader.cut_waiting if reader is not None else False
 
     def start(self, flow) -> bool:
         """在后台线程里跑 `flow(reader) -> int`。已经在跑就返回 False，不叠加。
@@ -56,8 +63,7 @@ class RunController:
             reader = self._reader if self._running else None
         if reader is None:
             return False
-        reader.post(command)
-        return True
+        return reader.post(command)
 
     def wait(self, timeout: float | None = None) -> bool:
         """等这次运行结束。返回 True 表示确实结束了。"""

@@ -21,6 +21,7 @@ _ACTION_LABELS = {
     "cnc_home": "CNC 回原点", "cnc_unlock": "CNC 解锁", "cnc_position": "CNC 位置查询",
     "inject_once": "单次植入", "save": "配置保存", "load": "配置加载", "names": "配置列表查询",
     "finish_cut": "剪丝后松上阀并保持安全位",
+    "retry_injection": "原位重做本次植入",
 }
 
 
@@ -103,6 +104,7 @@ class CustomPage(tk.Toplevel):
         self._closing = False
         self._exit_requested = False
         self._exit_check_pending = False
+        self._cut_pending = False
         self._buttons = []
         self.values = {key: tk.StringVar(self, value=value) for key, value in (
             ("needle_pitch_mm", "10"), ("travel_mm", "2"),
@@ -130,6 +132,7 @@ class CustomPage(tk.Toplevel):
         button = ttk.Button(parent, text=label, command=lambda: self._request(action, capture))
         button.pack(fill="x", pady=2)
         self._buttons.append(button)
+        return button
 
     def _build(self):
         body = ttk.Frame(self, padding=8)
@@ -176,6 +179,7 @@ class CustomPage(tk.Toplevel):
         config = self._group(body, "参数 / 配置", 1, 1)
         self._button(config, "按当前参数植入一次", "inject_once", self._injection_values)
         self._button(config, "剪丝完成，松上阀并保持安全位", "finish_cut")
+        self.repeat_button = self._button(config, "原位重做本次植入", "retry_injection")
         self._entry(config, "配置名称", self.name)
         self._button(config, "保存当前参数", "save", lambda: (self._name(), self._all_values()))
         self._button(config, "加载配置", "load", lambda: (self._name(),))
@@ -210,6 +214,24 @@ class CustomPage(tk.Toplevel):
     def _request(self, action, capture=None):
         if self._busy or self._closing or self._exit_requested:
             return
+        if action == "retry_injection":
+            if not self._cut_pending:
+                self._note("没有等待剪丝的植入，未执行重做。", error=True)
+                return
+            prompt = ("原位重做本次植入？请先处理好金属丝，确认原位可重做并让双手离开。"
+                      "CNC和伺服不重新定位，使用上次行程，忽略此时输入框中的参数修改。")
+            try:
+                if self.menu is not None:
+                    confirmed = self.menu.ask_yes_no(prompt, default=False)
+                else:
+                    box = _Dialog(self, prompt)
+                    with box:
+                        box.add_answer_buttons(focus=False)
+                    confirmed = box.result
+                if not confirmed:
+                    return
+            except WizardCancelled:
+                return
         try:
             captured = capture() if capture is not None else ()
         except ValueError as exc:
@@ -228,6 +250,8 @@ class CustomPage(tk.Toplevel):
     def _sync_buttons(self):
         for button in self._buttons:
             button.configure(state="disabled" if self._busy or self._closing or self._exit_requested else "normal")
+        self.repeat_button.configure(state="disabled" if self._busy or self._closing or self._exit_requested
+                                     or not self._cut_pending else "normal")
 
     def _note(self, text, *, error=False):
         self.status.set(text)
@@ -280,12 +304,14 @@ class CustomPage(tk.Toplevel):
                     self.warnings_label.configure(text="\n".join(warnings))
                     self._note("参数已加载；动作会连接设备并可能移动机构。"
                                + (" 请先查看配置警告；各组件操作分别校验。" if warnings else ""))
-                elif action == "inject_once":
+                elif action in ("inject_once", "retry_injection"):
+                    self._cut_pending = getattr(value, "state", None) is RunState.WAITING_OPERATOR
                     if getattr(value, "state", None) is RunState.WAITING_OPERATOR:
                         self._note("已抬高等待剪丝，上阀保持夹紧。剪完并让双手离开后，点击‘剪丝完成，松上阀并保持安全位’。")
                     else:
                         self._note("单次植入完成。请剪断针丝后再点击下一次植入；不会自动继续。")
                 elif action == "finish_cut":
+                    self._cut_pending = False
                     self._note("剪丝确认完成，上阀已松开，滑台保持剪丝安全位。可移动 CNC；下一次植入才下降回对刀位。")
                 else:
                     self._note(f"{label}完成" + (f"：{value}" if value is not None else ""))

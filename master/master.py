@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT))
 from master.coordinator import Coordinator, RunState
 from master.local_config import load_merged, local_path_for, write_local
 from master.model import HEAD_WORK_MIN_MM, HEAD_WORK_MAX_MM, PRESET_ANGLES, HeadMotion, MachineGeometry, PresetSpec, validate_cut_clearance_mm
-from master.operator_gate import OperatorGate
+from master.operator_gate import OperatorGate, REPEAT
 from master.planner import highest_work_z_mm, plan_at_x, plan_at_y, plan_preset_row, work_z_mm
 from master.simulated import SimulationRig
 
@@ -200,7 +200,7 @@ def _read_stop_commands(commands: queue.Queue[str], *, echo=None,
     自己退出。加这道闸是为了让它在运行**结束后**读到的那一行不被当成指令：否则操作员
     敲给下一个提示（菜单、下一次运行）的那一下会被这个线程吃掉。
     """
-    prompt = "运行中，回车确认下一步，输入 ! 急停 > "
+    prompt = "运行中，回车继续，R 原位重做，! 急停 > "
     while True:
         try:
             if echo is not None:
@@ -537,7 +537,8 @@ def _execute_live_job(cfg: dict, row: PresetSpec, motion: HeadMotion, scan_z: fl
         row_y_mm = position[1]
     plan = plan_at_y(plan, row_y_mm)
     print(f"本排固定 CNC Y={row_y_mm:g} mm（本次对刀位置）；植入及换排回排头均保持此 Y。")
-    gate = OperatorGate(cut_clearance_mm=motion.cut_clearance_mm)
+    gate = OperatorGate(cut_clearance_mm=motion.cut_clearance_mm,
+                        on_waiting=getattr(command_reader, "set_cut_waiting", None))
     turn_gate = RowTurnGate()
     reporter = _make_reporter(row, plan, motion, scan_z, results_dir, datum=datum)
     coordinator = Coordinator(devices.servo, devices.cnc, devices.head, motion,
@@ -558,7 +559,7 @@ def _execute_live_job(cfg: dict, row: PresetSpec, motion: HeadMotion, scan_z: fl
            if motion.cut_clearance_mm else
            "实时运行：每次两针退回且 B 阀排气后，请剪丝并按回车移动到下一落点；")
           + "一排跑完后 CNC 抬到安全高度并回到排头，转管后按回车继续下一排；"
-          "输入 D 正常收工，输入 ! 请求三路停止。")
+          "等待剪丝时输入 R 原位重做，输入 D 正常收工，输入 ! 请求三路停止。")
     commands: queue.Queue[str] = queue.Queue()
     stop_reading = threading.Event()
     # 指令来源可替换：终端里是 `_read_stop_commands` 阻塞在 input() 上，图形界面里
@@ -585,11 +586,16 @@ def _execute_live_job(cfg: dict, row: PresetSpec, motion: HeadMotion, scan_z: fl
                 coordinator.request_stop()
             elif turn_gate.decline(command):
                 print("不再跑下一排，本次作业正常收工。")
+            elif command.strip().upper() == REPEAT:
+                if gate.submit(command):
+                    print("已选择原位重做本次植入；完成后仍等待剪丝，不进入下一落点。")
+                else:
+                    print("当前未等待剪丝或本次选择已提交，未执行重做。")
             elif command.strip() == "":
                 if not (gate.submit(command) or turn_gate.submit(command)):
                     print("当前没有等待中的人工确认。")
             else:
-                print("当前需要按回车继续；输入 D 可在排间正常收工，! 可停止。")
+                print("按回车继续；等待剪丝时 R 原位重做，排间 D 收工，! 停止。")
         except queue.Empty:
             pass
         except KeyboardInterrupt:

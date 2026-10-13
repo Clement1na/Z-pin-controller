@@ -15,7 +15,7 @@ from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
-FIELDS = ("row", "index", "cnc_x_mm", "cnc_y_mm", "needle_hits", "status", "duration_s", "error")
+FIELDS = ("row", "index", "cnc_x_mm", "cnc_y_mm", "needle_hits", "status", "duration_s", "error", "attempt")
 
 
 class RunReporter:
@@ -37,6 +37,7 @@ class RunReporter:
         self._writer = None
         # 每排的 index 都从 0 重新数，所以键必须是 (row, index) 才不串排。
         self._started: dict[tuple[int, int], float] = {}
+        self._attempts: dict[tuple[int, int], int] = {}
         self._artifacts: tuple[Path, Path] | None = None
         try:
             self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -69,6 +70,7 @@ class RunReporter:
     # ---- coordinator 进度回调 ----
     def placement_started(self, row: int, index: int, total: int, placement) -> None:
         self._started[(row, index)] = time.monotonic()
+        self._attempts[(row, index)] = self._attempts.get((row, index), 0) + 1
 
     def placement_finished(self, row: int, index: int, total: int, placement, *,
                            ok: bool, error: str | None) -> None:
@@ -86,6 +88,7 @@ class RunReporter:
                 "status": "ok" if ok else "incomplete",
                 "duration_s": duration,
                 "error": error or "",
+                "attempt": self._attempts.get((row, index), 1),
             })
             # 每个落点一次 flush：约每分钟一次，代价可忽略，换来断电后不丢已完成落点。
             self._stream.flush()
@@ -113,6 +116,7 @@ class RunReporter:
         summary = {
             "state": result.state.name,
             "completed_placements": result.completed_placements,
+            "repeat_attempts": sum(max(0, count-1) for count in self._attempts.values()),
             "placements_per_row": result.placements_per_row,
             "completed_rows": result.completed_rows,
             "error": result.error,

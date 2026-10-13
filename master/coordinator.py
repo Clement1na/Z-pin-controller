@@ -9,6 +9,7 @@ from enum import Enum
 from typing import Callable
 
 from master.model import HeadMotion
+from master.operator_gate import REPEAT
 from master.planner import RowPlan, work_z_mm
 
 
@@ -261,15 +262,44 @@ class Coordinator:
                 raise
             self._completed += 1
             self._notify("placement_finished", row, index, total, placement, ok=True, error=None)
-            if self.motion.cut_clearance_mm or index + 1 < total:
+            while self.motion.cut_clearance_mm or index + 1 < total:
                 self.state = RunState.WAITING_OPERATOR
                 self._check_cancel()
-                if not self.confirm_next(index + 1, total, self.cancel_event):
+                decision = self.confirm_next(index + 1, total, self.cancel_event)
+                if not decision:
                     raise _StopRequested()
                 self._check_cancel()
+                if decision == REPEAT:
+                    self._completed -= 1  # the operator rejected the previous attempt
+                    self._notify("placement_started", row, index, total, placement)
+                    try:
+                        self._repeat_cycle((placement.cnc_x_mm, placement.cnc_y_mm,
+                                            work_z_mm(plan, placement.cnc_x_mm, self.z_datum)))
+                    except BaseException as exc:
+                        self._notify("placement_finished", row, index, total, placement,
+                                     ok=False, error=str(exc) or type(exc).__name__)
+                        raise
+                    self._completed += 1
+                    self._notify("placement_finished", row, index, total, placement, ok=True, error=None)
+                    continue
                 if self.motion.cut_clearance_mm:
                     self._finish_cut()
                 self.state = RunState.RUNNING
+                break
+
+    def _repeat_cycle(self, cnc_position):
+        """Repeat only the head/clamp cycle; never reposition the CNC or servo."""
+        self._check_cancel()
+        if cnc_position is not None:
+            actual = self.cnc.position()
+            if (actual is None or len(actual) != 3
+                    or not all(math.isfinite(v) and abs(v-target) <= 0.05
+                               for v, target in zip(actual, cnc_position))):
+                raise RuntimeError("CNC 已离开本次植入位置，未执行原位重做")
+        self._finish_cut()
+        self.state = RunState.RUNNING
+        self._prepare_standby()
+        self._cycle_one()
 
     def run(self, plan: RowPlan, *, confirm_next_row=None) -> RunResult:
         """Run the row; ``confirm_next_row`` repeats it after the operator turns the tube.
@@ -341,6 +371,15 @@ class Coordinator:
         if not plan.placements:
             raise ValueError("单次注入需要至少一个排程落点")
         self._check_single_ready()
+        self._single_cnc_connected = self.cnc.connected
+        self._single_cnc_position = None
+        if self._single_cnc_connected:
+            try:
+                position = self.cnc.position()
+                if position is not None and len(position) == 3 and all(math.isfinite(v) for v in position):
+                    self._single_cnc_position = tuple(position)
+            except Exception:
+                pass  # a standalone stroke still does not require CNC communication
         self._completed = 0
         self.state = RunState.RUNNING
         try:
@@ -369,6 +408,27 @@ class Coordinator:
             self.state = RunState.FAULT
             return RunResult(self.state, self._completed, 1, 0,
                              self._stop_reason(str(exc)))
+
+    def repeat_single(self) -> RunResult:
+        if self.state is not RunState.WAITING_OPERATOR or not self.motion.cut_clearance_mm:
+            raise RuntimeError("没有等待剪丝的单次植入，不能原位重做")
+        self._completed = 0
+        try:
+            if self._single_cnc_connected and self._single_cnc_position is None:
+                raise RuntimeError("无法确认原植入位置，未执行原位重做")
+            self._repeat_cycle(self._single_cnc_position)
+            self._completed = 1
+            self.state = RunState.WAITING_OPERATOR
+            return RunResult(self.state, 1, 1, 0)
+        except _StopRequested:
+            self.request_stop()
+            self.state = RunState.STOPPED
+            return RunResult(self.state, 0, 1, 0, self._stop_reason("操作员请求停止"))
+        except Exception as exc:
+            cancelled = self.cancel_event.is_set()
+            self.request_stop()
+            self.state = RunState.STOPPED if cancelled else RunState.FAULT
+            return RunResult(self.state, 0, 1, 0, self._stop_reason(str(exc)))
 
     def finish_single_cut(self) -> RunResult:
         if self.state is not RunState.WAITING_OPERATOR or not self.motion.cut_clearance_mm:

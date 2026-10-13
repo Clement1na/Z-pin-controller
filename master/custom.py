@@ -364,6 +364,19 @@ class CustomController:
         self._cut_coordinator = None
         return result
 
+    def retry_injection(self):
+        self._check()
+        coordinator = self._cut_coordinator
+        if coordinator is None:
+            raise RuntimeError("没有等待剪丝的单次植入，不能原位重做")
+        if self.devices.cnc is not coordinator.cnc and self.devices.cnc.connected:
+            raise RuntimeError("CNC 连接已变化，无法确认原位；未执行重做")
+        result = coordinator.repeat_single()
+        if result.state is not RunState.WAITING_OPERATOR:
+            self.stop()
+            raise RuntimeError(result.error or "原位重做失败")
+        return result
+
     def names(self): return self.store.list_names("custom")
 
     def save(self, name):
@@ -492,14 +505,16 @@ def run_custom_menu(*, store, selection, config_path, debug=False, menu=None,
         ("22", "CNC 当前位置"), ("23", "单次注入（保持 CNC 当前坐标）"),
         ("24", "保存自定义配置"), ("25", "加载自定义配置"), ("26", "列出自定义配置"),
         ("27", "剪丝完成，松开上阀并保持剪丝安全位"),
+        ("28", "原位重做本次植入（完成后再次等待剪丝）"),
         ("!", "全机停止"), ("0", "退出（Q 也可退出）"))
     simple = dict(zip(("2", "3", "4", "5", "6", "8", "9", "10", "11", "12", "13",
-                       "18", "20", "21", "23", "27", "!"),
+                       "18", "20", "21", "23", "27", "28", "!"),
                       (controller.servo_pitch, controller.servo_enable, controller.servo_set_zero,
                        controller.servo_release, controller.servo_reset_fault, controller.head_travel,
                        controller.head_standby, controller.head_enable, controller.head_zero,
                        controller.head_release, controller.head_stop, controller.valves_off,
-                       controller.cnc_home, controller.cnc_unlock, controller.inject_once, controller.finish_cut, controller.stop)))
+                       controller.cnc_home, controller.cnc_unlock, controller.inject_once, controller.finish_cut,
+                       controller.retry_injection, controller.stop)))
     try:
         menu.warn("每次上电必须重新核实实际机械零位；屏幕显示 0 不代表机械零位。")
         menu.warn("植入深度没有固定上限；自定义输入为滑台下针行程，仍须在已确认的工作窗口内。")
@@ -515,7 +530,7 @@ def run_custom_menu(*, store, selection, config_path, debug=False, menu=None,
                 choice = menu.choose("自定义控制（所有操作在本页）", actions)
                 if choice in ("0", "q", "Q"):
                     return 0
-                if choice in ("4", "11", "23"):
+                if choice in ("4", "11", "23", "28"):
                     menu.ask("请确认实际机械位置、装丝和行程安全；回车执行，Q 退出")
                 if choice in simple:
                     hardware(simple[choice])
