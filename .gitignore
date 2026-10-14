@@ -33,3 +33,39 @@ third-party/docs/*.PDF
 
 # Native host-compiled firmware test artifact
 tests/firmware_head_harness.exe
+
+# GitHub publication: keep local development/experiment material out of Git.
+/docs/
+/tests/
+/DEVELOPMENT_LOG.md
+/ENVIRONMENT.md
+/findings.md
+/progress.md
+/task_plan.md
+/third-party/docs/
+/third-party/drivers/
+/third-party/hardware/
+/third-party/AccelStepper/examples/
+/third-party/AccelStepper/extras/
+/firmware/legacy/
+/scripts/demo_no_hardware.py
+**/config.local.toml
+**/profiles/
+**/runs/
+*.log
+.env
+.env.*
+!.env.example
+.claude/
+.codex/
+.agents/
+
+# Older loose reference files and vendor examples are local-only too.
+/*.PDF
+/*.pdf
+/*.exe
+/*.jpg
+/*.png
+/1.cpp
+/libraries/AccelStepper/examples/
+/libraries/AccelStepper/extras/

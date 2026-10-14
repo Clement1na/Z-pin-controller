@@ -7,10 +7,10 @@
 
 *.bat  text eol=crlf
 *.cmd  text eol=crlf
+
 # 二进制文件不做换行转换
 *.exe  binary
 *.PDF  binary
 *.jpg  binary
 *.png  binary
 *.ino  -text
-third-party/docs/*.PDF filter=lfs diff=lfs merge=lfs -text
