@@ -462,6 +462,8 @@ def run_setup_wizard(config_path, job_overrides=None, *, wizard=None, find_adapt
                 (("reuse", "使用已保存对刀点"), ("new", "新建／重新对刀")), default="new") == "reuse"
             if reuse:
                 motion = saved_motion
+        if cli.threading_from_config(cfg.get("cycle", {})):
+            cli.validate_threading_motion(motion)
         # 先落盘一次：即使后面在零点或对刀处中止，操作员选的端口/网卡也留下来了。
         _apply(cfg, env)
         # Keep measured coordinates and confirmation flags untouched until

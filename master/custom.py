@@ -8,7 +8,7 @@ import sys
 import threading
 from pathlib import Path
 
-from master.coordinator import Coordinator, RunState
+from master.coordinator import Coordinator, RunState, threading_from_config, validate_threading_motion
 from master.local_config import load_merged
 from master.model import HeadMotion, MachineGeometry, validate_cut_clearance_mm
 from master.planner import Placement, RowPlan
@@ -74,6 +74,7 @@ class CustomController:
                     else _load_config(store, selection, config_path))
         self.menu, self.debug = menu, debug
         self._cut_coordinator = None
+        self._has_injected = False  # Session history; never persisted as a machine datum.
         from master.master import LiveDevices, UnavailableDevice, _known_geometry
         self.geometry = _known_geometry()
         self.warnings = []
@@ -310,6 +311,9 @@ class CustomController:
     def inject_once(self):
         self._ensure_cut_finished()
         motion = self._motion(for_injection=True)  # New motion for every button press.
+        threading_enabled = threading_from_config(self.cfg.get("cycle", {}))
+        if threading_enabled:
+            validate_threading_motion(motion)  # Before any device is opened or moved.
         if not motion.cut_clearance_mm and self.cfg.get("cycle", {}).get("upper_release_after_retract") is not True:
             raise RuntimeError("单次注入前必须确认回针后释放上夹持阀的时序")
         head = self._device("head")
@@ -328,12 +332,16 @@ class CustomController:
         coordinator = Coordinator(servo, self.devices.cnc, head, motion, scan_z_mm=0.0,
                                   operator_confirmed=True,
                                   servo_required=False, warning=self._warn,
+                                  wire_threading_enabled=threading_enabled,
+                                  first_injection=not self._has_injected,
                                   valve_delay_s=self.cfg.get("cycle", {}).get("valve_delay_ms", 500) / 1000)
         coordinator.cancel_event = self.cancel_event
         for device in (servo, self.devices.cnc, head):
             device.cancel_event = self.cancel_event
         self._check()
         result = coordinator.run_single(plan)
+        if result.state in (RunState.WAITING_OPERATOR, RunState.COMPLETE):
+            self._has_injected = True
         if result.state is RunState.WAITING_OPERATOR:
             self._cut_coordinator = coordinator
             message = (f"GX28 已额外上抬 {motion.cut_clearance_mm:g} mm，电机保持使能，B 阀保持夹紧。"

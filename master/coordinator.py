@@ -35,12 +35,27 @@ class _StopRequested(Exception):
     pass
 
 
+def threading_from_config(cycle: dict) -> bool:
+    enabled = cycle.get("wire_threading_enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("配置：[cycle] wire_threading_enabled 必须是 true 或 false")
+    return enabled
+
+
+def validate_threading_motion(motion: HeadMotion) -> float:
+    target = motion.standby_mm + 1.0  # 1 mm along the slide, not normal to the tube.
+    if not math.isfinite(target) or not motion.work_min_mm <= target <= motion.work_max_mm:
+        raise ValueError("套丝位置（对刀位上方 1 mm）超出已确认的滑台工作窗口")
+    return target
+
+
 class Coordinator:
     def __init__(self, servo, cnc, head, motion: HeadMotion, *, scan_z_mm: float,
                  operator_confirmed: bool, z_datum: tuple[float, float] | None = None,
                  valve_delay_s: float = 0.5,
                  confirm_next: Callable[[int, int, threading.Event], bool] | None = None,
-                 progress=None, servo_required: bool = True, warning=None):
+                 progress=None, servo_required: bool = True, warning=None,
+                 wire_threading_enabled: bool = False, first_injection: bool = True):
         if not math.isfinite(scan_z_mm) or not math.isfinite(valve_delay_s) or valve_delay_s < 0:
             raise ValueError("scan_z_mm 和 valve_delay_s 必须是有限数，且延时不能为负")
         if z_datum is not None:
@@ -49,6 +64,13 @@ class Coordinator:
                     raise ValueError(f"对刀点 {name} 必须是有限数")
         self.servo, self.cnc, self.head = servo, cnc, head
         self.motion = motion
+        if not isinstance(wire_threading_enabled, bool) or not isinstance(first_injection, bool):
+            raise ValueError("套丝开关与首次植入标记必须是 bool")
+        self.wire_threading_enabled = wire_threading_enabled
+        self._threading_position = (validate_threading_motion(motion)
+                                    if wire_threading_enabled else None)
+        # Attempts count independently of accepted placements, including repeats/rows.
+        self._has_injected = not first_injection
         self.scan_z_mm = scan_z_mm
         #: (x0, z0) read at touch-off. The work height is z0 + (x - x0)*tan(theta):
         #: within a row the needles stay parallel to the tube, so the head has to
@@ -164,6 +186,29 @@ class Coordinator:
             raise RuntimeError("滑台未到已记录的剪丝安全位；未移动 CNC")
         self._check_cancel()
 
+    def _perform_cycle(self) -> None:
+        if self.wire_threading_enabled and self._has_injected:
+            self._check_cancel()
+            self._check_head_position()
+            self.head.valve("a", False)
+            self._delay()
+            self.head.valve("b", True)
+            self._delay()
+            self.head.move_mm(self._threading_position)
+            self._check_cancel()
+            position = self.head.position_mm()
+            if (not self.head.zero_confirmed or not math.isfinite(position)
+                    or abs(position-self._threading_position) > 0.05):
+                raise RuntimeError("滑台未到表面上方 1 mm 套丝位置；未执行植入")
+            self._check_cancel()
+            self.head.valve("b", False)
+            self._delay()
+        else:
+            self._prepare_standby()
+        # Same absolute target: from the threading height this is old travel + 1 mm.
+        self._cycle_one()
+        self._has_injected = True
+
     def _position_servo(self, target_mm) -> None:
         if self.servo_required:
             self.servo.move_mm(target_mm)
@@ -253,8 +298,7 @@ class Coordinator:
                 self.cnc.move_to(placement.cnc_x_mm, placement.cnc_y_mm,
                                  work_z_mm(plan, placement.cnc_x_mm, self.z_datum))
                 self._check_cancel()
-                self._prepare_standby()
-                self._cycle_one()
+                self._perform_cycle()
             except BaseException as exc:
                 # 落点中途失败或急停：必须留下一行，否则"跑到哪了"无从查起。
                 self._notify("placement_finished", row, index, total, placement,
@@ -298,8 +342,7 @@ class Coordinator:
                 raise RuntimeError("CNC 已离开本次植入位置，未执行原位重做")
         self._finish_cut()
         self.state = RunState.RUNNING
-        self._prepare_standby()
-        self._cycle_one()
+        self._perform_cycle()
 
     def run(self, plan: RowPlan, *, confirm_next_row=None) -> RunResult:
         """Run the row; ``confirm_next_row`` repeats it after the operator turns the tube.
@@ -386,8 +429,7 @@ class Coordinator:
             self._check_cancel()
             self._position_servo(plan.servo_target_mm)
             self._check_cancel()
-            self._prepare_standby()
-            self._cycle_one()
+            self._perform_cycle()
             self._completed = 1
             if self.motion.cut_clearance_mm:
                 self.state = RunState.WAITING_OPERATOR

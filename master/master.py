@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from master.coordinator import Coordinator, RunState
+from master.coordinator import Coordinator, RunState, threading_from_config, validate_threading_motion
 from master.local_config import load_merged, local_path_for, write_local
 from master.model import HEAD_WORK_MIN_MM, HEAD_WORK_MAX_MM, PRESET_ANGLES, HeadMotion, MachineGeometry, PresetSpec, validate_cut_clearance_mm
 from master.operator_gate import OperatorGate, REPEAT
@@ -110,7 +110,8 @@ def run_simulation(row: PresetSpec, *, inject_failure: bool = False, rows: int =
     coordinator = Coordinator(rig.servo, rig.cnc, rig.head, motion,
                               scan_z_mm=scan_z_mm, operator_confirmed=True,
                               z_datum=datum, valve_delay_s=0,
-                              confirm_next=lambda done, total, cancel: not cancel.is_set())
+                              confirm_next=lambda done, total, cancel: not cancel.is_set(),
+                              wire_threading_enabled=True)
     _print_plan(row, plan, datum=datum)
     confirm_next_row = None
     if rows > 1:
@@ -165,6 +166,8 @@ def _read_live_configuration(path: Path, confirmed: bool,
                         work_max_mm=required("head", "work_max_mm"),
                         datum_confirmed=required("head", "datum_confirmed"),
                         cut_clearance_mm=cut_clearance)
+    if threading_from_config(cfg.get("cycle", {})):
+        validate_threading_motion(motion)
     if not (HEAD_WORK_MIN_MM <= motion.work_min_mm < motion.work_max_mm <= HEAD_WORK_MAX_MM):
         raise ValueError(f"配置：head 工作窗口必须位于固件限位 [{HEAD_WORK_MIN_MM:g}, {HEAD_WORK_MAX_MM:g}] mm 内")
     recorded_safe = cfg.get("head", {}).get("cut_safe_mm", motion.cut_position_mm)
@@ -546,7 +549,8 @@ def _execute_live_job(cfg: dict, row: PresetSpec, motion: HeadMotion, scan_z: fl
                               valve_delay_s=cfg["cycle"]["valve_delay_ms"] / 1000,
                               confirm_next=gate.wait_for_ready,
                               servo_required=False, warning=lambda message: print(f"警告：{message}"),
-                              progress=reporter)
+                              progress=reporter,
+                              wire_threading_enabled=threading_from_config(cfg.get("cycle", {})))
 
     def confirm_next_row(completed_rows: int, cancel: threading.Event) -> bool:
         """一排跑完 → 抬到安全高度、回排头 → 等人工剪丝转管。默认一直跑下去。"""
@@ -554,6 +558,9 @@ def _execute_live_job(cfg: dict, row: PresetSpec, motion: HeadMotion, scan_z: fl
             return False
         return turn_gate.wait_for_turn(completed_rows, cancel)
 
+    print("套丝已开启：仅整个作业第一次沿用原流程；后续落点、换排与原位重做，"
+          "先上阀夹紧并到对刀位上方 1 mm，再松上阀、夹下阀，走原植入行程 +1 mm。"
+          if coordinator.wire_threading_enabled else "套丝已关闭：本次使用旧版植入流程。")
     print((f"实时运行：每次退针后 GX28 额外上抬 {motion.cut_clearance_mm:g} mm，B 阀保持夹紧；"
            "剪丝完成并让双手离开后按回车，松开 B 阀并保持剪丝安全位。最后一次同样需要确认；"
            if motion.cut_clearance_mm else
