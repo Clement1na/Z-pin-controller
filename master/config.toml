@@ -32,7 +32,7 @@ datum_confirmed = false  # set true only after measuring the signed useful windo
 
 [cycle]
 valve_delay_ms = 500
-wire_threading_enabled = true # first stroke unchanged; later strokes clamp B at standby+1 mm
+wire_threading_enabled = true # first stroke unchanged; later strokes clamp B at standby+2 mm
                               # false restores the pre-threading sequence (also in custom mode)
 cut_clearance_mm = 15.0   # extra GX28 lift; B remains clamped until cutting is confirmed
 upper_release_after_retract = false  # legacy 0-clearance flow only; positive clearance waits for cutting

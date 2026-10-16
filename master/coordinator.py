@@ -43,9 +43,9 @@ def threading_from_config(cycle: dict) -> bool:
 
 
 def validate_threading_motion(motion: HeadMotion) -> float:
-    target = motion.standby_mm + 1.0  # 1 mm along the slide, not normal to the tube.
+    target = motion.standby_mm + 2.0  # 2 mm along the slide, not normal to the tube.
     if not math.isfinite(target) or not motion.work_min_mm <= target <= motion.work_max_mm:
-        raise ValueError("套丝位置（对刀位上方 1 mm）超出已确认的滑台工作窗口")
+        raise ValueError("套丝位置（对刀位上方 2 mm）超出已确认的滑台工作窗口")
     return target
 
 
@@ -199,13 +199,13 @@ class Coordinator:
             position = self.head.position_mm()
             if (not self.head.zero_confirmed or not math.isfinite(position)
                     or abs(position-self._threading_position) > 0.05):
-                raise RuntimeError("滑台未到表面上方 1 mm 套丝位置；未执行植入")
+                raise RuntimeError("滑台未到表面上方 2 mm 套丝位置；未执行植入")
             self._check_cancel()
             self.head.valve("b", False)
             self._delay()
         else:
             self._prepare_standby()
-        # Same absolute target: from the threading height this is old travel + 1 mm.
+        # Same absolute target: from the threading height this is old travel + 2 mm.
         self._cycle_one()
         self._has_injected = True
 
