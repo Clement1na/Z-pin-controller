@@ -559,7 +559,7 @@ def _execute_live_job(cfg: dict, row: PresetSpec, motion: HeadMotion, scan_z: fl
         return turn_gate.wait_for_turn(completed_rows, cancel)
 
     print("套丝已开启：仅整个作业第一次沿用原流程；后续落点、换排与原位重做，"
-          "先上阀夹紧并到对刀位上方 2 mm，再松上阀、夹下阀，走原植入行程 +2 mm。"
+          "先上阀夹紧并到对刀位上方 1 mm，再松上阀、夹下阀，走原植入行程 +1 mm。"
           if coordinator.wire_threading_enabled else "套丝已关闭：本次使用旧版植入流程。")
     print((f"实时运行：每次退针后 GX28 额外上抬 {motion.cut_clearance_mm:g} mm，B 阀保持夹紧；"
            "剪丝完成并让双手离开后按回车，松开 B 阀并保持剪丝安全位。最后一次同样需要确认；"
