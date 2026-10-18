@@ -130,7 +130,8 @@ def run_simulation(row: PresetSpec, *, inject_failure: bool = False, rows: int =
 def _read_live_configuration(path: Path, confirmed: bool,
                              job_overrides: dict[str, float] | None = None, *,
                              datum: tuple[float, float] | None = None, job_source=None,
-                             row_y_mm: float | None = None, row_x_mm: float | None = None):
+                             row_y_mm: float | None = None, row_x_mm: float | None = None,
+                             head_clearance_travel: bool = False):
     if not confirmed:
         raise ValueError("配置：实机模式必须给出 --confirm-datum")
     # 模板 + 同级的 config.local.toml（向导生成）。本机文件不存在时完全等价于只读模板。
@@ -166,6 +167,8 @@ def _read_live_configuration(path: Path, confirmed: bool,
                         work_max_mm=required("head", "work_max_mm"),
                         datum_confirmed=required("head", "datum_confirmed"),
                         cut_clearance_mm=cut_clearance)
+    if head_clearance_travel and cut_clearance <= 0:
+        raise ValueError("配置：抬针移动模式必须保留剪丝抬升距离")
     if threading_from_config(cfg.get("cycle", {})):
         validate_threading_motion(motion)
     if not (HEAD_WORK_MIN_MM <= motion.work_min_mm < motion.work_max_mm <= HEAD_WORK_MAX_MM):
@@ -188,7 +191,7 @@ def _read_live_configuration(path: Path, confirmed: bool,
     # 排间安全高度必须高过排内**最高**的工作点。theta 带符号：正角时最高点在排尾、
     # 负角时在排头。写成 min 或假定单调，负角下"抬到安全高度"会变成向下扎进管子。
     highest = highest_work_z_mm(plan, datum)
-    if scan_z + 1e-9 < highest:
+    if not head_clearance_travel and scan_z + 1e-9 < highest:
         raise ValueError(
             f"配置：scan_z_mm {scan_z:g} mm 低于排内最高工作点 {highest:+.3f} mm；"
             f"照这个高度抬刀，排间移动会扎进管子")
@@ -532,7 +535,8 @@ def _make_reporter(row, plan, motion, scan_z, results_dir, *, datum=None):
 def _execute_live_job(cfg: dict, row: PresetSpec, motion: HeadMotion, scan_z: float,
                       plan, devices: LiveDevices, *, datum=None, rows: int | None = None,
                       results_dir: Path | None = None, echo=None,
-                      command_reader=None, row_y_mm: float | None = None) -> int:
+                      command_reader=None, row_y_mm: float | None = None,
+                      head_clearance_travel: bool = False) -> int:
     if row_y_mm is None:
         position = devices.cnc.position()
         if position is None:
@@ -550,7 +554,8 @@ def _execute_live_job(cfg: dict, row: PresetSpec, motion: HeadMotion, scan_z: fl
                               confirm_next=gate.wait_for_ready,
                               servo_required=False, warning=lambda message: print(f"警告：{message}"),
                               progress=reporter,
-                              wire_threading_enabled=threading_from_config(cfg.get("cycle", {})))
+                              wire_threading_enabled=threading_from_config(cfg.get("cycle", {})),
+                              head_clearance_travel=head_clearance_travel)
 
     def confirm_next_row(completed_rows: int, cancel: threading.Event) -> bool:
         """一排跑完 → 抬到安全高度、回排头 → 等人工剪丝转管。默认一直跑下去。"""
@@ -565,7 +570,10 @@ def _execute_live_job(cfg: dict, row: PresetSpec, motion: HeadMotion, scan_z: fl
            "剪丝完成并让双手离开后按回车，松开 B 阀并保持剪丝安全位。最后一次同样需要确认；"
            if motion.cut_clearance_mm else
            "实时运行：每次两针退回且 B 阀排气后，请剪丝并按回车移动到下一落点；")
-          + "一排跑完后 CNC 抬到安全高度并回到排头，转管后按回车继续下一排；"
+          + ("一排跑完后保持抬针，CNC 沿工作斜面返回排头，转管后按回车继续；"
+             if head_clearance_travel else
+             "一排跑完后 CNC 抬到安全高度并回到排头，转管后按回车继续下一排；")
+          +
           "等待剪丝时输入 R 原位重做，输入 D 正常收工，输入 ! 请求三路停止。")
     commands: queue.Queue[str] = queue.Queue()
     stop_reading = threading.Event()

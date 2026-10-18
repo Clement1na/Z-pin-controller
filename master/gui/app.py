@@ -54,15 +54,20 @@ def prefer_chinese_font(root: tk.Misc) -> None:
 
 class MainWindow:
     def __init__(self, root: tk.Tk, sink: queue.Queue, *,
-                 config_path: Path, results_dir: Path | None = None):
+                 config_path: Path, results_dir: Path | None = None, user_mode: bool = False):
         self.root = root
         self.sink = sink
         self.config_path = Path(config_path)
         self.results_dir = results_dir
+        self.user_mode = user_mode
         self._closing = False
         self._prepared_config = None
         self._configuration_results = queue.Queue()
-        self.menu = TkMenu(root, sink)
+        if user_mode:
+            from master.gui.user_menu import UserMenu
+            self.menu = UserMenu(root, sink)
+        else:
+            self.menu = TkMenu(root, sink)
         self.store = ProfileStore(self.config_path.parent / "profiles")
         self.selection = self.store.load_selection()
         self.debug_var = tk.BooleanVar(value=False)
@@ -82,7 +87,7 @@ class MainWindow:
 
     # ------------------------------------------------------------------ 布局
     def _build(self) -> None:
-        self.root.title("Z-pin 五针植入控制")
+        self.root.title("Z-pin 植入控制（用户版）" if self.user_mode else "Z-pin 五针植入控制")
         outer = ttk.Frame(self.root, padding=10)
         outer.pack(fill="both", expand=True)
 
@@ -91,7 +96,7 @@ class MainWindow:
 
         modes = ttk.Frame(outer)
         modes.pack(fill="x", pady=(8, 0))
-        for label, command in (
+        entries = (
             ("接口与机器配置", self._configure_interfaces),
             ("实机运行（会连接并可能移动机构）", self._live),
             ("仿真（不接硬件）", self._simulate),
@@ -99,11 +104,15 @@ class MainWindow:
             ("配置档案", self._profiles),
             ("预设任务", self._preset),
             ("完全自定义", self._custom),
-        ):
+        )
+        if self.user_mode:
+            entries = (entries[0], entries[1], entries[-1])
+        for label, command in entries:
             ttk.Button(modes, text=label, command=command).pack(side="left", padx=(0, 6))
 
-        ttk.Checkbutton(outer, text="调试输出（回显设备每一行）",
-                        variable=self.debug_var).pack(anchor="w", pady=(8, 0))
+        if not self.user_mode:
+            ttk.Checkbutton(outer, text="调试输出（回显设备每一行）",
+                            variable=self.debug_var).pack(anchor="w", pady=(8, 0))
 
         self.log = scrolledtext.ScrolledText(outer, height=22, width=96,
                                              wrap="word", state="disabled")
@@ -274,7 +283,12 @@ class MainWindow:
 
         def flow(reader):
             try:
-                cfg = prepare_interfaces(self.config_path, self.menu,
+                if self.user_mode:
+                    from master.user_interfaces import prepare_user_interfaces
+                    cfg = prepare_user_interfaces(self.config_path, self.menu,
+                                                   store=self.store, selection=selection)
+                else:
+                    cfg = prepare_interfaces(self.config_path, self.menu,
                                          store=self.store, selection=selection)
             except WizardCancelled:
                 self._note("接口与机器配置已取消。")
@@ -310,7 +324,10 @@ class MainWindow:
                               on_configuration_changed=self._invalidate_configuration)
             self._start(page.run, "完全自定义")
             return
-        from master.wizard import run_setup_wizard
+        if self.user_mode:
+            from master.user_workflow import run_user_setup
+        else:
+            from master.wizard import run_setup_wizard
 
         debug = self.debug_var.get()
         selection = dict(self.selection)
@@ -319,6 +336,10 @@ class MainWindow:
 
         def flow(reader):
             try:
+                if self.user_mode:
+                    return run_user_setup(config_path, menu=self.menu, results_dir=results_dir,
+                        command_reader=reader, profile_store=self.store,
+                        profile_selection=selection, prepared_config=prepared_config)
                 return run_setup_wizard(
                     config_path, results_dir=results_dir, debug=debug,
                     wizard=self.menu, menu=self.menu, command_reader=reader,

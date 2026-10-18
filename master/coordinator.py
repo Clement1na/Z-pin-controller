@@ -55,7 +55,8 @@ class Coordinator:
                  valve_delay_s: float = 0.5,
                  confirm_next: Callable[[int, int, threading.Event], bool] | None = None,
                  progress=None, servo_required: bool = True, warning=None,
-                 wire_threading_enabled: bool = False, first_injection: bool = True):
+                 wire_threading_enabled: bool = False, first_injection: bool = True,
+                 head_clearance_travel: bool = False):
         if not math.isfinite(scan_z_mm) or not math.isfinite(valve_delay_s) or valve_delay_s < 0:
             raise ValueError("scan_z_mm 和 valve_delay_s 必须是有限数，且延时不能为负")
         if z_datum is not None:
@@ -64,6 +65,11 @@ class Coordinator:
                     raise ValueError(f"对刀点 {name} 必须是有限数")
         self.servo, self.cnc, self.head = servo, cnc, head
         self.motion = motion
+        if not isinstance(head_clearance_travel, bool):
+            raise ValueError("抬针移动模式必须是 bool")
+        if head_clearance_travel and motion.cut_clearance_mm <= 0:
+            raise ValueError("抬针移动模式必须保留正的剪丝抬升距离")
+        self.head_clearance_travel = head_clearance_travel
         if not isinstance(wire_threading_enabled, bool) or not isinstance(first_injection, bool):
             raise ValueError("套丝开关与首次植入标记必须是 bool")
         self.wire_threading_enabled = wire_threading_enabled
@@ -125,8 +131,13 @@ class Coordinator:
         if self.z_datum is None:
             raise RuntimeError("作业前必须通过对刀确认对刀点")
         position = self.cnc.position()
-        if position is None or abs(position[2] - self.scan_z_mm) > 0.05:
+        entry_z = (work_z_mm(plan, plan.placements[0].cnc_x_mm, self.z_datum)
+                   if self.head_clearance_travel else self.scan_z_mm)
+        if position is None or not math.isfinite(position[2]) or abs(position[2] - entry_z) > 0.05:
             raise RuntimeError("作业前 CNC 必须位于已确认的 scan_z_mm 高度")
+        if self.head_clearance_travel and (not math.isfinite(position[0]) or
+                abs(position[0]-plan.placements[0].cnc_x_mm) > 0.05):
+            raise RuntimeError("作业前 CNC X 必须位于已确认的对刀排头")
         if not math.isfinite(position[1]) or abs(position[1] - plan.placements[0].cnc_y_mm) > 0.05:
             raise RuntimeError("作业前 CNC Y 与对刀时确认的位置不一致；请重新对刀，抬刀时只调整 Z")
         self._check_head_position()
@@ -375,7 +386,9 @@ class Coordinator:
                     break
                 # 排间回到安全高度再回排头：自转重复是"一模一样的一排"。
                 self._prepare_travel()
-                self.cnc.move_to(head.cnc_x_mm, head.cnc_y_mm, self.scan_z_mm)
+                return_z = (work_z_mm(plan, head.cnc_x_mm, self.z_datum)
+                            if self.head_clearance_travel else self.scan_z_mm)
+                self.cnc.move_to(head.cnc_x_mm, head.cnc_y_mm, return_z)
                 self._check_cancel()
                 self.state = RunState.WAITING_OPERATOR
                 confirmed = confirm_next_row(completed_rows, self.cancel_event)

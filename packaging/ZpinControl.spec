@@ -1,22 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller onedir 打包描述。一份业务，两个入口，共用一套 `_internal/`。
-
-| EXE | 入口 | 形态 |
-|---|---|---|
-| `ZpinControl.exe`   | `master/master.py`   | 控制台。终端菜单、`--smoke-test`、`--live` 等全部照旧 |
-| `ZpinControlUI.exe` | `master/gui_main.py` | 窗口。双击即用，背后没有黑窗口 |
-
-两个入口读的是**同一份** `config.toml`（`default_config_path()` 在冻结态取
-`sys.executable` 的同级目录，两个 exe 都在 `dist/ZpinControl/` 下）。
-
-为什么需要 pathex：`master/master.py` 在运行期才 `sys.path.insert` 仓库根、
-`servo/`、`cnc3d/src`，而 PyInstaller 是在**构建期**做静态分析的，运行期的
-insert 它看不见。所以这三条路径必须在这里显式告诉它，否则 `sv630n_pc` /
-`cnc_grbl` 这两个惰性导入会在打包时被判为"找不到"而漏掉，直到实机连伺服才炸。
-
-为什么是 onedir 而不是 onefile：onefile 每次启动都要把整个包解到临时目录，
-Npcap 那套 EtherCAT 初始化对启动耗时敏感；而且 onedir 的 `config.toml` 就摆在
-exe 旁边，操作员改端口不用解包。
+"""Three entry points, two independent onedir deliveries.
+User: ZpinControl/ZpinControlUI.exe (master/user_gui_main.py).
+Debug: ZpinControlDebug/ZpinControlDebug.exe and ZpinControl.exe.
+Each delivery uses its own sibling config.toml and persistent state.
+Explicit pathex/hiddenimports include lazy hardware drivers. Tcl/Tk DLLs
+come from the active environment to match the collected script libraries.
 """
 import os
 import sys
@@ -27,6 +15,7 @@ ROOT = Path(SPECPATH).resolve().parent
 
 ENTRY_CLI = ROOT / "master" / "master.py"
 ENTRY_UI = ROOT / "master" / "gui_main.py"
+ENTRY_USER = ROOT / "master" / "user_gui_main.py"
 
 # ---------------------------------------------------------------------------
 # 让 DLL 解析先看**正在跑打包的这个环境**，而不是 PATH 上碰到的第一个同名 DLL。
@@ -49,7 +38,7 @@ if _ENV_BIN.is_dir():
     os.environ["PATH"] = str(_ENV_BIN) + os.pathsep + os.environ.get("PATH", "")
 
 analysis = Analysis(
-    [str(ENTRY_CLI), str(ENTRY_UI)],
+    [str(ENTRY_CLI), str(ENTRY_UI), str(ENTRY_USER)],
     pathex=[str(ROOT), str(ROOT / "servo"), str(ROOT / "cnc3d" / "src")],
     binaries=[],
     datas=[],
@@ -78,10 +67,10 @@ analysis = Analysis(
 
 pyz = PYZ(analysis.pure)
 
-# `analysis.scripts` 里是「runtime hooks + 两个程序脚本」三段，**不能整个传给 EXE**：
+# `analysis.scripts` 里是「runtime hooks + 三个程序脚本」三段，**不能整个传给 EXE**：
 # 实测过，那样每个 EXE 会把两个入口**都跑一遍**（先跑终端主流程再跑窗口），窗口版
-# 会在后台莫名其妙地跑一次 `main()`。所以按源文件路径挑，hook 两份都留。
-_PROGRAM_SCRIPTS = {os.path.normcase(str(ENTRY_CLI)), os.path.normcase(str(ENTRY_UI))}
+# 会在后台莫名其妙地跑一次 `main()`。所以按源文件路径挑，hook 三份都留。
+_PROGRAM_SCRIPTS = {os.path.normcase(str(p)) for p in (ENTRY_CLI, ENTRY_UI, ENTRY_USER)}
 
 
 def scripts_for(entry):
@@ -110,11 +99,11 @@ exe_cli = EXE(
     disable_windowed_traceback=False,
 )
 
-exe_ui = EXE(
+exe_debug = EXE(
     pyz,
     scripts_for(ENTRY_UI),
     exclude_binaries=True,
-    name="ZpinControlUI",
+    name="ZpinControlDebug",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -126,12 +115,34 @@ exe_ui = EXE(
     disable_windowed_traceback=False,
 )
 
-coll = COLLECT(
-    exe_cli,
-    exe_ui,
+exe_user = EXE(
+    pyz,
+    scripts_for(ENTRY_USER),
+    exclude_binaries=True,
+    name="ZpinControlUI",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=False,
+    disable_windowed_traceback=False,
+)
+
+user_delivery = COLLECT(
+    exe_user,
     analysis.binaries,
     analysis.datas,
     strip=False,
     upx=False,
     name="ZpinControl",
+)
+
+debug_delivery = COLLECT(
+    exe_cli,
+    exe_debug,
+    analysis.binaries,
+    analysis.datas,
+    strip=False,
+    upx=False,
+    name="ZpinControlDebug",
 )

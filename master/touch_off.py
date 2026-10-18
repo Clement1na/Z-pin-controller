@@ -35,7 +35,7 @@ def make_record(cfg, row, xyz, motion, scan_z):
             "work_min_mm": motion.work_min_mm, "work_max_mm": motion.work_max_mm}
 
 
-def read_record(cfg, row, plan):
+def read_record(cfg, row, plan, *, head_clearance_travel=False):
     record = cfg.get(SECTION)
     if record is None:
         return None
@@ -57,14 +57,18 @@ def read_record(cfg, row, plan):
                         cut_clearance_mm=_finite(record.get("cut_clearance_mm"), "剪丝距离"))
     if not HEAD_WORK_MIN_MM <= motion.work_min_mm <= 0 <= motion.work_max_mm <= HEAD_WORK_MAX_MM:
         raise ValueError("保存的滑台工作窗口无效，请重新对刀")
-    if scan_z+1e-9 < highest_work_z_mm(plan_at_x(plan, xyz[0]), (xyz[0], xyz[2])):
+    if head_clearance_travel and motion.cut_clearance_mm != HEAD_PRE_DESCENT_MM:
+        raise ValueError("用户版需要15 mm剪丝抬升，请重新对刀")
+    if not head_clearance_travel and scan_z+1e-9 < highest_work_z_mm(plan_at_x(plan, xyz[0]), (xyz[0], xyz[2])):
         raise ValueError("保存的安全Z低于本排工作高度，请重新对刀")
     return xyz, motion, scan_z
 
 
-def restore_position(cnc, head, xyz, motion, scan_z):
+def restore_position(cnc, head, xyz, motion, scan_z, *, destination_z=None):
     """Stay at confirmed head zero until CNC has reached the saved safe position."""
     position = _finite(head.position_mm(), "当前滑台位置")
+    if destination_z is not None:
+        destination_z = _finite(destination_z, "目标工作Z")
     if not head.zero_confirmed or abs(position) > 0.05:
         raise RuntimeError("复用对刀点前必须确认 GX28 在本次人工零位0 mm")
     events = [getattr(device, "cancel_event", None) for device in (cnc, head)]
@@ -104,7 +108,8 @@ def restore_position(cnc, head, xyz, motion, scan_z):
     failure = None
     try:
         check_cancel()
-        _restore_position(cnc, head, xyz, motion, scan_z, check_cancel)
+        _restore_position(cnc, head, xyz, motion, scan_z, check_cancel,
+                          destination_z=destination_z)
         check_cancel()
     except BaseException as exc:
         failure = exc
@@ -119,12 +124,22 @@ def restore_position(cnc, head, xyz, motion, scan_z):
         raise failure
 
 
-def _restore_position(cnc, head, xyz, motion, scan_z, check_cancel):
+def _restore_position(cnc, head, xyz, motion, scan_z, check_cancel, *, destination_z=None):
     verify = getattr(head, "verify_work_window", None)
     if verify is not None:
         verify(motion)
     head.valve("a", False)
     head.valve("b", False)
+    def position_head():
+        check_cancel()
+        head.motion = motion
+        head.move_mm(motion.cut_position_mm)
+        actual_head = head.position_mm()
+        if (not head.zero_confirmed or not math.isfinite(actual_head)
+                or abs(actual_head-motion.cut_position_mm) > 0.05):
+            raise RuntimeError("恢复 GX28 剪丝安全位回读不一致")
+    if destination_z is not None:
+        position_head()
     current = cnc.position()
     if current is None or len(current) != 3:
         raise RuntimeError("读不到 CNC 工作坐标，未恢复已保存对刀点")
@@ -142,8 +157,12 @@ def _restore_position(cnc, head, xyz, motion, scan_z, check_cancel):
                                  for v, target in zip(actual, (xyz[0], xyz[1], scan_z))):
         raise RuntimeError("恢复对刀点的 CNC 安全位置回读不一致")
     check_cancel()
-    head.motion = motion
-    head.move_mm(motion.cut_position_mm)
-    actual_head = head.position_mm()
-    if not math.isfinite(actual_head) or abs(actual_head-motion.cut_position_mm) > 0.05:
-        raise RuntimeError("恢复 GX28 剪丝安全位回读不一致")
+    if destination_z is None:
+        position_head()
+    else:
+        cnc.move_to(xyz[0], xyz[1], destination_z)
+        check_cancel()
+        actual = cnc.position()
+        if actual is None or len(actual) != 3 or not all(math.isfinite(v) and abs(v-target) <= 0.05
+                for v, target in zip(actual, (xyz[0], xyz[1], destination_z))):
+            raise RuntimeError("恢复对刀工作位置回读不一致")

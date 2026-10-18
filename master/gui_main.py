@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, user_mode: bool = False) -> int:
     parser = argparse.ArgumentParser(description="Z-pin 五针植入控制（图形界面）")
     parser.add_argument("--config", type=Path, default=None,
                         help="配置模板路径；默认取 exe 同级的 config.toml")
@@ -48,7 +48,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        MainWindow(root, sink, config_path=config_path, results_dir=args.results_dir)
+        MainWindow(root, sink, config_path=config_path, results_dir=args.results_dir, user_mode=user_mode)
     except Exception as exc:  # noqa: BLE001 — 起窗口失败必须让人看见，不能静默退出
         messagebox.showerror("Z-pin", f"界面初始化失败：{exc}")
         print(f"错误：界面初始化失败：{exc}")

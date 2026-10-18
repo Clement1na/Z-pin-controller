@@ -1,36 +1,17 @@
-﻿# Build the onedir deliverable into dist\ZpinControl\.
-#
-# ASCII-only on purpose: Windows PowerShell 5.1 decodes .ps1 as ANSI unless the
-# file carries a UTF-8 BOM, so any non-ASCII text written here would turn into
-# mojibake on the machines this is meant to run on. The operator-facing Chinese
-# documentation lives in packaging\README.md instead.
-#
-# Runs under the default execution policy; do not reach for -ExecutionPolicy
-# Bypass unless this machine's policy actually forbids running scripts.
-#
-# Usage:
-#   powershell -File packaging\build.ps1
-#   powershell -File packaging\build.ps1 -Python C:\py\python.exe
-
+# Build separate hardware-only user and full debug onedir deliveries.
+# ASCII-only for Windows PowerShell 5.1. User docs live in README.md/DEBUG.md.
 param(
-    [string]$Python = "D:\miniconda3\envs\zpin\python.exe"
+    [string]$Python = "D:\miniconda3\envs\zpin\python.exe",
+    [string]$PreparedStage = ""
 )
-
 $ErrorActionPreference = "Stop"
-
-if (-not (Test-Path $Python)) {
-    throw "Python not found: $Python  (pass -Python <path-to-python.exe>)"
-}
-
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
-
-$target = Join-Path $root "dist\ZpinControl"
+if (-not (Test-Path -LiteralPath $Python)) { throw "Python not found: $Python" }
 $buildId = [guid]::NewGuid().ToString("N")
-$stageParent = Join-Path $root ("build\package-stage-" + $buildId)
-$staged = Join-Path $stageParent "ZpinControl"
-$previous = Join-Path $root ("build\previous-delivery-" + $buildId)
-
+$stageParent = if ($PreparedStage) { [IO.Path]::GetFullPath($PreparedStage) } else {
+    Join-Path $root ("build\package-stage-" + $buildId)
+}
 function Assert-WorkspacePath([string]$Path) {
     $full = [IO.Path]::GetFullPath($Path)
     $prefix = [IO.Path]::GetFullPath($root).TrimEnd('\') + '\'
@@ -38,92 +19,104 @@ function Assert-WorkspacePath([string]$Path) {
         throw "Delivery path outside workspace: $full"
     }
     if (Test-Path -LiteralPath $full) {
-        $item = Get-Item -LiteralPath $full
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-            throw "Refusing to replace a linked delivery directory: $full"
+        if ((Get-Item -LiteralPath $full).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "Refusing linked delivery path: $full"
         }
     }
 }
-
+$userTarget = Join-Path $root 'dist\ZpinControl'
+$debugTarget = Join-Path $root 'dist\ZpinControlDebug'
+$deliveries = @(
+    @{ Target=$userTarget; Stage=(Join-Path $stageParent 'ZpinControl');
+       Previous=(Join-Path $root ("build\previous-delivery-"+$buildId));
+       Failed=(Join-Path $root ("build\failed-user-delivery-"+$buildId));
+       Exes=@('ZpinControlUI.exe'); Docs='README.md'; Installed=$false; HadPrevious=$false },
+    @{ Target=$debugTarget; Stage=(Join-Path $stageParent 'ZpinControlDebug');
+       Previous=(Join-Path $root ("build\previous-debug-delivery-"+$buildId));
+       Failed=(Join-Path $root ("build\failed-debug-delivery-"+$buildId));
+       Exes=@('ZpinControl.exe','ZpinControlDebug.exe'); Docs='DEBUG.md'; Installed=$false; HadPrevious=$false }
+)
 function Assert-DeliveryClosed {
-    $executables = @((Join-Path $target 'ZpinControl.exe'), (Join-Path $target 'ZpinControlUI.exe'))
-    foreach ($process in @(Get-Process -Name ZpinControl,ZpinControlUI -ErrorAction SilentlyContinue)) {
-        if ($executables -contains $process.Path) {
-            throw "Close the Z-pin application before packaging (PID $($process.Id)); existing delivery was not changed."
+    $paths = @((Join-Path $userTarget 'ZpinControl.exe'), (Join-Path $userTarget 'ZpinControlUI.exe'),
+               (Join-Path $debugTarget 'ZpinControl.exe'), (Join-Path $debugTarget 'ZpinControlDebug.exe'))
+    foreach ($process in @(Get-Process -Name ZpinControl,ZpinControlUI,ZpinControlDebug -ErrorAction SilentlyContinue)) {
+        if ($paths -contains $process.Path) {
+            throw "Close the Z-pin application safely before promotion (PID $($process.Id)); existing delivery was not changed."
         }
     }
 }
-
-# Never let PyInstaller clean the active delivery. A failed COLLECT can delete
-# base_library.zip before encountering a locked DLL, leaving both EXEs broken.
-Assert-DeliveryClosed
 Assert-WorkspacePath $stageParent
-& $Python -m PyInstaller --noconfirm --clean `
-    --distpath $stageParent --workpath build `
-    (Join-Path $PSScriptRoot "ZpinControl.spec")
-if ($LASTEXITCODE -ne 0) {
-    throw "PyInstaller failed with exit code $LASTEXITCODE; existing delivery was not changed. Staging: $stageParent"
+if (-not $stageParent.StartsWith(([IO.Path]::GetFullPath((Join-Path $root 'build'))+'\'), [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Staging must be inside project build directory: $stageParent"
 }
-
-foreach ($name in @('ZpinControl.exe', 'ZpinControlUI.exe', '_internal\base_library.zip',
-                     '_internal\_tkinter.pyd', '_internal\tcl86t.dll', '_internal\tk86t.dll')) {
-    if (-not (Test-Path -LiteralPath (Join-Path $staged $name) -PathType Leaf)) {
-        throw "Incomplete staged delivery: $name; existing delivery was not changed."
+foreach ($delivery in $deliveries) {
+    foreach ($path in @($delivery.Target,$delivery.Stage,$delivery.Previous,$delivery.Failed)) { Assert-WorkspacePath $path }
+}
+if (-not $PreparedStage) {
+    # Never clean the live dist folder.
+    & $Python -m PyInstaller --noconfirm --clean --distpath $stageParent --workpath build `
+        (Join-Path $PSScriptRoot 'ZpinControl.spec')
+    if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed ($LASTEXITCODE); existing deliveries unchanged. Staging: $stageParent" }
+}
+foreach ($delivery in $deliveries) {
+    foreach ($name in ($delivery.Exes + @('_internal\base_library.zip','_internal\_tkinter.pyd','_internal\tcl86t.dll','_internal\tk86t.dll'))) {
+        if (-not (Test-Path -LiteralPath (Join-Path $delivery.Stage $name) -PathType Leaf)) {
+            throw "Incomplete staged delivery: $($delivery.Stage)\$name; existing deliveries unchanged."
+        }
+    }
+    if (-not @(Get-ChildItem -LiteralPath (Join-Path $delivery.Stage '_internal') -Filter 'python3*.dll' -File).Count) {
+        throw "Staged Python runtime missing: $($delivery.Stage)"
     }
 }
-if (-not @(Get-ChildItem -LiteralPath (Join-Path $staged '_internal') -Filter 'python3*.dll' -File).Count) {
-    throw "Staged Python runtime missing; existing delivery was not changed."
-}
-
-# Copy the latest user state only after building, then promote complete folders.
-# Keep the previous folder for recovery rather than recursively deleting it.
 Assert-DeliveryClosed
-foreach ($name in @('config.toml', 'config.local.toml', 'profiles', 'runs')) {
-    $source = Join-Path $target $name
-    if (Test-Path -LiteralPath $source) {
-        Copy-Item -LiteralPath $source -Destination $staged -Recurse -Force
-        Write-Host "preserved $name"
+# Initial debug delivery inherits the existing machine. Later builds preserve its own state.
+$debugSource = if (Test-Path -LiteralPath $debugTarget) { $debugTarget } else { $userTarget }
+$readmeName = (-join ([char[]]@(0x4f7f,0x7528,0x8bf4,0x660e))) + '.md'
+foreach ($delivery in $deliveries) {
+    $sourceRoot = if ($delivery.Target -eq $userTarget) { $userTarget } else { $debugSource }
+    foreach ($name in @('config.toml','config.local.toml','profiles','runs')) {
+        $source = Join-Path $sourceRoot $name
+        if (Test-Path -LiteralPath $source) {
+            Copy-Item -LiteralPath $source -Destination $delivery.Stage -Recurse -Force
+            Write-Host "preserved $($delivery.Target): $name"
+        }
     }
+    if (-not (Test-Path -LiteralPath (Join-Path $delivery.Stage 'config.toml'))) {
+        Copy-Item -LiteralPath (Join-Path $root 'master\config.toml') -Destination $delivery.Stage
+    }
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot $delivery.Docs) -Destination (Join-Path $delivery.Stage $readmeName)
+    $firmware = Join-Path $delivery.Stage 'firmware\insert_head'
+    New-Item -ItemType Directory -Path $firmware -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $root 'firmware\insert_head\insert_head.ino') -Destination $firmware
 }
-$config = Join-Path $staged 'config.toml'
-if (-not (Test-Path -LiteralPath $config)) {
-    Copy-Item -LiteralPath (Join-Path $root 'master\config.toml') -Destination $config
-}
-$readmeName = (-join ([char[]]@(0x4f7f, 0x7528, 0x8bf4, 0x660e))) + '.md'
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'README.md') -Destination (Join-Path $staged $readmeName)
-# Ship the matching sketch for later flashing; never flash from the builder.
-$firmwareDir = Join-Path $staged 'firmware\insert_head'
-New-Item -ItemType Directory -Path $firmwareDir -Force | Out-Null
-Copy-Item -LiteralPath (Join-Path $root 'firmware\insert_head\insert_head.ino') -Destination $firmwareDir
-
 Assert-DeliveryClosed
-foreach ($path in @($target, $staged, $previous)) { Assert-WorkspacePath $path }
-New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
-$hadPrevious = Test-Path -LiteralPath $target
-if ($hadPrevious) {
-    Move-Item -LiteralPath $target -Destination $previous
-}
+New-Item -ItemType Directory -Path (Join-Path $root 'dist') -Force | Out-Null
 try {
-    Move-Item -LiteralPath $staged -Destination $target
+    foreach ($delivery in $deliveries) {
+        $delivery.HadPrevious = Test-Path -LiteralPath $delivery.Target
+        if ($delivery.HadPrevious) { Move-Item -LiteralPath $delivery.Target -Destination $delivery.Previous }
+        Move-Item -LiteralPath $delivery.Stage -Destination $delivery.Target
+        $delivery.Installed = $true
+    }
 } catch {
-    if ($hadPrevious -and -not (Test-Path -LiteralPath $target)) {
-        Move-Item -LiteralPath $previous -Destination $target
+    $restoreOrder = @($deliveries)
+    [array]::Reverse($restoreOrder)
+    foreach ($delivery in $restoreOrder) {
+        if ($delivery.Installed -and (Test-Path -LiteralPath $delivery.Target)) {
+            Move-Item -LiteralPath $delivery.Target -Destination $delivery.Failed
+        }
+        if ($delivery.HadPrevious -and (Test-Path -LiteralPath $delivery.Previous) -and -not (Test-Path -LiteralPath $delivery.Target)) {
+            Move-Item -LiteralPath $delivery.Previous -Destination $delivery.Target
+        }
     }
     throw
 }
-if ($hadPrevious) { Write-Host "previous delivery retained: $previous" }
-# COLLECT's output has moved out; this parent is now empty (no recursive delete).
+foreach ($delivery in $deliveries) {
+    Write-Host "Built: $($delivery.Target)"
+    if ($delivery.HadPrevious) { Write-Host "previous delivery retained: $($delivery.Previous)" }
+}
+# Both complete folders moved out; this parent is empty.
 Remove-Item -LiteralPath $stageParent
-
-Write-Host ""
-Write-Host "Built: $target"
-Write-Host ""
-Write-Host "Acceptance test (console):"
-Write-Host "  cd `"$target`""
-Write-Host "  .\ZpinControl.exe --smoke-test"
-Write-Host "  expect: 12 placements in 3 rows, valves closed, exit code 0"
-Write-Host ""
-Write-Host "Acceptance test (windowed):"
-Write-Host "  double-click ZpinControlUI.exe"
-Write-Host "  expect: window opens with NO console behind it; click the smoke-test"
-Write-Host "          button and the same 12 placements appear in the log pane"
+Write-Host 'User: dist\ZpinControl\ZpinControlUI.exe (three hardware modes)'
+Write-Host 'Debug: dist\ZpinControlDebug\ZpinControlDebug.exe (original full GUI)'
+Write-Host 'CLI check: dist\ZpinControlDebug\ZpinControl.exe --smoke-test'
