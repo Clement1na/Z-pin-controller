@@ -8,10 +8,11 @@ import math
 import tkinter as tk
 from tkinter import ttk
 
-from master.gui.menu import TkMenu
+from master.gui.menu import TkMenu, parse_float
 from master.local_config import load_merged
 from master.model import PresetSpec, PRESET_ANGLES, PRESET_COUNTS
 from master.user_interfaces import scan_interfaces, ranked_candidates, save_interface_selection
+from master.regions import TubeJobParameters, TubeLayout
 
 
 class InterfaceForm(ttk.Frame):
@@ -175,9 +176,10 @@ class UserMenu(TkMenu):
                 form.closed = True
         return self._on_main(dialog)
 
-    def job_parameters(self, defaults):
+    def job_parameters(self, defaults, *, regions=None):
         def dialog():
-            box = self._dialog('设置本次植入任务：20 mm强化区，仅安装最右两针，机械针距10 mm。')
+            box = self._dialog('三个工作区组成一排；每区沿用原20 mm排程，仅装最右两针、针距10 mm。'
+                               '区间空白按管子上的实际长度填写，保存后各排沿用。')
             body = ttk.Frame(box._body)
             body.pack(fill='x', before=box._error_label)
             count = tk.StringVar(body, value=str(defaults.get('count', 7) if defaults.get('count', 7) in PRESET_COUNTS else 7))
@@ -190,15 +192,25 @@ class UserMenu(TkMenu):
                 self.warn('已保存深度无效，本次先显示默认3 mm，请重新核对')
                 depth_value = 3
             depth = tk.StringVar(body, value=f"{depth_value:g}")
-            for row, (label, var, values) in enumerate((('每排根数', count, PRESET_COUNTS),
+            gap_value = ''
+            if regions and 'gap_mm' in regions:
+                try:
+                    gap_value = f'{TubeLayout.from_config(regions).gap_mm:g}'
+                except ValueError as exc:
+                    self.warn(f'已保存区域间距无效：{exc}；请重新填写')
+            gap = tk.StringVar(body, value=gap_value)
+            for row, (label, var, values) in enumerate((('每区根数', count, PRESET_COUNTS),
                                                        ('实际架角 °', angle, PRESET_ANGLES),
-                                                       ('植入深度 mm（垂直管面）', depth, None))):
+                                                       ('植入深度 mm（垂直管面）', depth, None),
+                                                       ('区间空白 mm（沿管长度）', gap, None))):
                 ttk.Label(body, text=label).grid(row=row, column=0, sticky='w', padx=(0, 20), pady=5)
                 field = (ttk.Entry(body, textvariable=var) if values is None else
                          ttk.Combobox(body, state='readonly', textvariable=var, values=tuple(str(v) for v in values)))
                 field.grid(row=row, column=1, sticky='ew', pady=5)
             with box:
-                box.add_buttons(ok=lambda: PresetSpec(float(angle.get()), int(count.get()), float(depth.get())),
+                box.add_buttons(ok=lambda: TubeJobParameters(
+                                    PresetSpec(float(angle.get()), int(count.get()), parse_float(depth.get())),
+                                    TubeLayout(parse_float(gap.get(), minimum=0))),
                                 ok_label='下一步：连接设备')
             return box.result
         return self._on_main(dialog)

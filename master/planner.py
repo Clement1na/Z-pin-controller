@@ -25,6 +25,8 @@ class RowPlan:
     servo_target_mm: float
     slope: float
     placements: tuple[Placement, ...]
+    region_counts: tuple[int, ...] = ()
+    region_gap_mm: float | None = None
 
 
 def _hits(base_mm: float, pitch_mm: float) -> tuple[tuple[float, float], ...]:

@@ -59,10 +59,12 @@ def _known_geometry() -> MachineGeometry:
 
 
 def _print_plan(row: PresetSpec, plan, *, datum=None, scan_z_mm: float | None = None, emit=print) -> None:
+    regions = getattr(plan, 'region_counts', ())
     step = row.needle_length_step_mm(plan.needle_pitch_mm)
     emit(f"作业：架角 {row.angle_deg:+g}°，强化区 {row.length_mm:g} mm，"
           f"点距 {row.spacing_mm:g} mm，深度 {row.depth_mm:g} mm")
-    emit(f"排程：每排 {row.x_count} 个植入点，{len(plan.placements)} 次扎针动作（每次两针），"
+    scope = f"每区 {row.x_count} 个植入点，三区合为一排" if regions else f"每排 {row.x_count} 个植入点"
+    emit(f"排程：{scope}，{len(plan.placements)} 次扎针动作（每次两针），"
           f"针距 {plan.needle_pitch_mm:g} mm，伺服目标 {plan.servo_target_mm:g} mm")
     emit(f"滑台行程 {row.slide_travel_mm:.4g} mm；"
           f"针长等差步长 {step:+.4g} mm（两针之间，这套针组只配 {row.angle_deg:+g}° 这个符号）")
@@ -71,6 +73,17 @@ def _print_plan(row: PresetSpec, plan, *, datum=None, scan_z_mm: float | None = 
         emit("20 mm 处不要求，第 10 根在 18 mm。")
     if row.count % 2:
         emit("补针时另一根针落在区外 30 mm；请确认余料可容纳，之后人工切除。")
+    if regions:
+        from master.regions import TubeLayout
+        layout = TubeLayout(plan.region_gap_mm)
+        emit(f"区间空白沿管 {layout.gap_mm:g} mm，从每区名义X=20 mm末边量起；区内排程保持原样。")
+        emit(f"三区名义总长沿管 {layout.span_mm(row.angle_deg):.3f} mm（不含区外补针余料）。")
+        start = 0
+        for number, count in enumerate(regions, 1):
+            x = plan.placements[start].cnc_x_mm
+            suffix = f"，Z={work_z_mm(plan,x,datum):.3f} mm" if datum is not None else ''
+            emit(f"第{number}区起点 X={x:.3f} mm{suffix}，本区{count}次动作。")
+            start += count
     if datum is not None:
         head = plan.placements[0].cnc_x_mm
         tail = plan.placements[-1].cnc_x_mm
@@ -566,6 +579,8 @@ def _execute_live_job(cfg: dict, row: PresetSpec, motion: HeadMotion, scan_z: fl
     print("套丝已开启：仅整个作业第一次沿用原流程；后续落点、换排与原位重做，"
           "先上阀夹紧并到对刀位上方 1.5 mm，再松上阀、夹下阀，走原植入行程 +1.5 mm。"
           if coordinator.wire_threading_enabled else "套丝已关闭：本次使用旧版植入流程。")
+    if getattr(plan, 'region_counts', ()):
+        print('三个工作区组成一排：区间自动移动，只有第三区完成并剪丝确认后才回第一区排头、等待转管。')
     print((f"实时运行：每次退针后 GX28 额外上抬 {motion.cut_clearance_mm:g} mm，B 阀保持夹紧；"
            "剪丝完成并让双手离开后按回车，松开 B 阀并保持剪丝安全位。最后一次同样需要确认；"
            if motion.cut_clearance_mm else

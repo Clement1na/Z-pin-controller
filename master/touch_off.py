@@ -64,11 +64,15 @@ def read_record(cfg, row, plan, *, head_clearance_travel=False):
     return xyz, motion, scan_z
 
 
-def restore_position(cnc, head, xyz, motion, scan_z, *, destination_z=None):
+def restore_position(cnc, head, xyz, motion, scan_z, *, destination_z=None, surface_slope=None):
     """Stay at confirmed head zero until CNC has reached the saved safe position."""
     position = _finite(head.position_mm(), "当前滑台位置")
     if destination_z is not None:
         destination_z = _finite(destination_z, "目标工作Z")
+    if surface_slope is not None:
+        surface_slope = _finite(surface_slope, '恢复路径斜率')
+        if destination_z is None:
+            raise ValueError('沿斜面恢复必须提供对刀工作Z')
     if not head.zero_confirmed or abs(position) > 0.05:
         raise RuntimeError("复用对刀点前必须确认 GX28 在本次人工零位0 mm")
     events = [getattr(device, "cancel_event", None) for device in (cnc, head)]
@@ -109,7 +113,7 @@ def restore_position(cnc, head, xyz, motion, scan_z, *, destination_z=None):
     try:
         check_cancel()
         _restore_position(cnc, head, xyz, motion, scan_z, check_cancel,
-                          destination_z=destination_z)
+                          destination_z=destination_z, surface_slope=surface_slope)
         check_cancel()
     except BaseException as exc:
         failure = exc
@@ -124,7 +128,8 @@ def restore_position(cnc, head, xyz, motion, scan_z, *, destination_z=None):
         raise failure
 
 
-def _restore_position(cnc, head, xyz, motion, scan_z, check_cancel, *, destination_z=None):
+def _restore_position(cnc, head, xyz, motion, scan_z, check_cancel, *, destination_z=None,
+                      surface_slope=None):
     verify = getattr(head, "verify_work_window", None)
     if verify is not None:
         verify(motion)
@@ -144,7 +149,14 @@ def _restore_position(cnc, head, xyz, motion, scan_z, check_cancel, *, destinati
     if current is None or len(current) != 3:
         raise RuntimeError("读不到 CNC 工作坐标，未恢复已保存对刀点")
     current = tuple(_finite(value, "当前CNC位置") for value in current)
-    travel_z = max(current[2], scan_z)
+    if surface_slope is None:
+        travel_z = max(current[2], scan_z)
+    else:
+        # Restore only between the current X and saved X. The farthest region
+        # is not on this path, so its height is irrelevant to this transfer.
+        current_surface_z = _finite(xyz[2]+(current[0]-xyz[0])*surface_slope, '恢复路径工作Z')
+        scan_z = destination_z
+        travel_z = max(current[2], scan_z, current_surface_z)
     check_cancel()
     cnc.move_to(current[0], current[1], travel_z)
     check_cancel()

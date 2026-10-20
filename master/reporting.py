@@ -22,6 +22,7 @@ class RunReporter:
     def __init__(self, *, job, plan, machine, motion, scan_z_mm: float, out_dir: Path,
                  datum: tuple[float, float] | None = None, stamp: datetime | None = None):
         self.job, self.plan, self.machine, self.motion = job, plan, machine, motion
+        self.region_counts = getattr(plan, 'region_counts', ())
         self.scan_z_mm = scan_z_mm
         self.datum = datum
         self.errors: list[str] = []
@@ -61,7 +62,8 @@ class RunReporter:
                 continue
             self.csv_path = path
             self.json_path = self.out_dir / f"{stem}.json"
-            self._writer = csv.DictWriter(self._stream, fieldnames=FIELDS)
+            fields = FIELDS + (("region", "region_index") if self.region_counts else ())
+            self._writer = csv.DictWriter(self._stream, fieldnames=fields)
             self._writer.writeheader()
             self._stream.flush()
             return
@@ -69,6 +71,9 @@ class RunReporter:
 
     # ---- coordinator 进度回调 ----
     def placement_started(self, row: int, index: int, total: int, placement) -> None:
+        if self.region_counts:
+            region, local = self._region_for(index)
+            print(f"第{row+1}排，第{region}/3区，第{local}/{self.region_counts[region-1]}次动作。")
         self._started[(row, index)] = time.monotonic()
         self._attempts[(row, index)] = self._attempts.get((row, index), 0) + 1
 
@@ -79,7 +84,7 @@ class RunReporter:
         started = self._started.pop((row, index), None)
         duration = "" if started is None else f"{time.monotonic() - started:.3f}"
         try:
-            self._writer.writerow({
+            record = {
                 "row": row + 1,
                 "index": index + 1,
                 "cnc_x_mm": f"{placement.cnc_x_mm:.4f}",
@@ -89,11 +94,21 @@ class RunReporter:
                 "duration_s": duration,
                 "error": error or "",
                 "attempt": self._attempts.get((row, index), 1),
-            })
+            }
+            if self.region_counts:
+                record['region'], record['region_index'] = self._region_for(index)
+            self._writer.writerow(record)
             # 每个落点一次 flush：约每分钟一次，代价可忽略，换来断电后不丢已完成落点。
             self._stream.flush()
         except (OSError, ValueError) as exc:
             self._fail(f"写结果行失败，后续落点不再记录：{exc}")
+
+    def _region_for(self, index):
+        for number, count in enumerate(self.region_counts, 1):
+            if index < count:
+                return number, index+1
+            index -= count
+        raise ValueError('结果记录的动作序号超出工作区排程')
 
     # ---- 收尾 ----
     def close(self) -> None:
@@ -136,6 +151,11 @@ class RunReporter:
             "warnings": list(warnings),
             "recording_errors": list(self.errors),
         }
+        if self.region_counts:
+            summary['regions'] = {'count': len(self.region_counts),
+                'gap_mm': self.plan.region_gap_mm,
+                'gap_definition': 'blank tube length between nominal X=20 mm regions',
+                'placements_per_region': list(self.region_counts)}
         try:
             tmp = self.json_path.with_name(self.json_path.name + ".tmp")
             tmp.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -9,9 +9,10 @@ import threading
 
 from master.model import DEFAULT_CUT_CLEARANCE_MM, HEAD_PRE_DESCENT_MM, PresetSpec
 from master.local_config import local_path_for, write_local
-from master.planner import highest_work_z_mm, plan_at_x
+from master.planner import plan_at_x
 from master.touch_off import SECTION, make_record, read_record, restore_position
 from master.wizard import WizardCancelled, _build_motion, _local_sections, _apply, preset_values
+from master.regions import TubeJobParameters, ThreeRegionJobSource
 
 
 def _check_cancel(event):
@@ -76,11 +77,13 @@ def run_user_setup(config_path, *, menu, prepared_config=None, profile_store=Non
     try:
         cfg = (deepcopy(prepared_config) if prepared_config is not None else
                prepare_user_interfaces(path, menu, store=profile_store, selection=selection))
-        row = menu.job_parameters(cfg.get('job', {}))
-        if not isinstance(row, PresetSpec):
-            row = PresetSpec(**row)
+        parameters = menu.job_parameters(cfg.get('job', {}), regions=cfg.get('regions', {}))
+        if not isinstance(parameters, TubeJobParameters):
+            raise ValueError('作业参数缺少已确认的三区间距，未连接设备')
+        row, layout = parameters.row, parameters.layout
         geometry = cli._known_geometry()
-        plan = cli.PresetJobSource().plan(row, geometry)
+        source = ThreeRegionJobSource(layout)
+        plan = source.plan(row, geometry)
         motion = _build_motion(row, DEFAULT_CUT_CLEARANCE_MM)
         if cli.threading_from_config(cfg.get('cycle', {})):
             cli.validate_threading_motion(motion)
@@ -104,6 +107,7 @@ def run_user_setup(config_path, *, menu, prepared_config=None, profile_store=Non
             if reuse:
                 motion = saved_motion
         cfg['job'] = preset_values(row)
+        cfg['regions'] = layout.as_config()
         write_local(local_path_for(path), cfg)
         devices = cli._open_live_devices(cfg, geometry, motion)
         for device in (devices.head, devices.cnc, devices.servo):
@@ -129,10 +133,8 @@ def run_user_setup(config_path, *, menu, prepared_config=None, profile_store=Non
                     menu.warn(f'伺服初始化失败：{exc}；未自动调整针距，请人工核对')
             if reuse:
                 touch_off, motion, _ = saved
-                bound_plan = plan_at_x(plan, touch_off[0])
-                travel_z = highest_work_z_mm(bound_plan, (touch_off[0], touch_off[2]))
-                restore_position(devices.cnc, devices.head, touch_off, motion, travel_z,
-                                 destination_z=touch_off[2])
+                restore_position(devices.cnc, devices.head, touch_off, motion, touch_off[2],
+                                 destination_z=touch_off[2], surface_slope=row.slope)
             else:
                 verify = getattr(devices.head, 'verify_work_window', None)
                 if verify is not None:
@@ -166,13 +168,14 @@ def run_user_setup(config_path, *, menu, prepared_config=None, profile_store=Non
             write_local(local_path_for(path), cfg)
             cfg, row, _, motion, scan_z, plan, datum = cli._read_live_configuration(
                 path, True, preset_values(row), datum=datum, row_y_mm=touch_off[1],
-                row_x_mm=touch_off[0], head_clearance_travel=True)
+                row_x_mm=touch_off[0], head_clearance_travel=True, job_source=source)
             cli._print_plan(row, plan, datum=datum, emit=menu.say)
             decision = menu.confirm_run(
-                f'{row.count}根，架角{row.angle_deg:g}°，深度{row.depth_mm:g} mm，'
+                f'3个区，每区{row.count}根，架角{row.angle_deg:g}°，深度{row.depth_mm:g} mm，'
                 f'滑台行程{row.slide_travel_mm:.3f} mm。\n'
+                f'区间空白沿管{layout.gap_mm:g} mm；三个区共{len(plan.placements)}次动作为一排。\n'
                 f'对刀 X={touch_off[0]:g} Y={touch_off[1]:g} Z={touch_off[2]:g} mm。\n'
-                '每次退针后GX28上抬15 mm，确认到位后才移动CNC；剪丝后确认继续。',
+                'GX28抬针15 mm并确认到位后才移动；每次剪丝后继续，三区完成回第一区等待转管。',
                 can_save=not reuse)
             _check_cancel(event)
             if not reuse and decision.get('save_touch_off'):

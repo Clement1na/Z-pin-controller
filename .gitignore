@@ -40,6 +40,7 @@ tests/firmware_head_harness.exe
 /docx/*
 !/docx/Q&A.md
 !/docx/使用说明.md
+!/docx/配置与交付说明.md
 /tests/
 /DEVELOPMENT_LOG.md
 /ENVIRONMENT.md

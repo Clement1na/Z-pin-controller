@@ -42,3 +42,9 @@ upper_release_after_retract = false  # legacy 0-clearance flow only; positive cl
 # angle_deg = 15.0       # choose 0, 15 or 30 degrees; needles stay vertical
 # count = 7              # preset density 7/10/15; fixed 20 mm zone, fixed 10 mm needle pitch
 # depth_mm = 2.0         # perpendicular to tube wall; no process cap, slide window still enforced
+
+# User GUI: three original preset regions make one turnable row.
+# Gap is the blank distance ALONG THE TUBE from the nominal X=20 region end
+# to the next region start. Enter once in the job form; saved in local/profile.
+[regions]
+# gap_mm = ...           # operator input; no assumed default on first use
